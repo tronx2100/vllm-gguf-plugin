@@ -234,7 +234,8 @@ class GGUFLinearMethod(LinearMethodBase):
         # plain linear layers and an untied lm_head (only used for logits); never an embedding table
         is_linear = type(self) is GGUFLinearMethod
         is_lm_head = type(layer).__name__ == "ParallelLMHead"
-        if os.environ.get("GGUF_NO_TILED") or self.layout is not None or not (is_linear or is_lm_head):
+        # (a head-tiling layout only reorders the layer input at run time, the weight stays in GGUF block order)
+        if os.environ.get("GGUF_NO_TILED") or not (is_linear or is_lm_head):
             return
         weight = layer.weight
         types = {layer.weight_type.shard_weight_type.get(i, layer.weight_type.weight_type) for i in weight.shard_id} or {
