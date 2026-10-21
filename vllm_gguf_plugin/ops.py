@@ -132,19 +132,21 @@ if (
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
 
-    @register_fake("_C_gguf::ggml_mul_mat_q3k_tiled")
-    def _ggml_mul_mat_q3k_tiled_fake(
+    @register_fake("_C_gguf::ggml_mul_mat_tiled")
+    def _ggml_mul_mat_tiled_fake(
         Wt: torch.Tensor,
         Wd: torch.Tensor,
         X: torch.Tensor,
+        quant_type: int,
         row: torch.SymInt,
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=Wt.device)
 
-    @register_fake("_C_gguf::ggml_dequantize_q3k_tiled")
-    def _ggml_dequantize_q3k_tiled_fake(
+    @register_fake("_C_gguf::ggml_dequantize_tiled")
+    def _ggml_dequantize_tiled_fake(
         Wt: torch.Tensor,
         Wd: torch.Tensor,
+        quant_type: int,
         rows: torch.SymInt,
         cols: torch.SymInt,
         dtype: torch.dtype | None = None,

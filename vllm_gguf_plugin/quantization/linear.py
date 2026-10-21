@@ -15,7 +15,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
 from .layout import GGUFLinearLayout
-from .tiled import Q3T_MAX_TOKENS, can_tile, repack_q3k
+from .tiled import TILED_MAX_TOKENS, can_tile, repack
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
@@ -89,19 +89,19 @@ def _fused_mul_mat_gguf(
     return y
 
 
-def _fused_mul_mat_q3k_tiled(
-    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, rows: int, cols: int
+def _fused_mul_mat_tiled(
+    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, weight_type: int, rows: int, cols: int
 ) -> torch.Tensor:
     if x.shape[0] == 0:
         return torch.empty(0, rows, dtype=x.dtype, device=x.device)
-    if x.shape[0] <= Q3T_MAX_TOKENS:
-        return torch.ops._C_gguf.ggml_mul_mat_q3k_tiled(wt, wd, x, rows)
-    w = torch.ops._C_gguf.ggml_dequantize_q3k_tiled(wt, wd, rows, cols, x.dtype)
+    if x.shape[0] <= TILED_MAX_TOKENS:
+        return torch.ops._C_gguf.ggml_mul_mat_tiled(wt, wd, x, weight_type, rows)
+    w = torch.ops._C_gguf.ggml_dequantize_tiled(wt, wd, weight_type, rows, cols, x.dtype)
     return x @ w.T
 
 
-def _fused_mul_mat_q3k_tiled_fake(
-    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, rows: int, cols: int
+def _fused_mul_mat_tiled_fake(
+    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, weight_type: int, rows: int, cols: int
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], rows, dtype=x.dtype, device=x.device)
 
@@ -116,11 +116,11 @@ def _fused_mul_mat_gguf_fake(
 
 try:
     direct_register_custom_op(
-        op_name="_fused_mul_mat_q3k_tiled",
-        op_func=_fused_mul_mat_q3k_tiled,
-        fake_impl=_fused_mul_mat_q3k_tiled_fake,
+        op_name="_fused_mul_mat_tiled",
+        op_func=_fused_mul_mat_tiled,
+        fake_impl=_fused_mul_mat_tiled_fake,
     )
-    fused_mul_mat_q3k_tiled = torch.ops.vllm._fused_mul_mat_q3k_tiled
+    fused_mul_mat_tiled = torch.ops.vllm._fused_mul_mat_tiled
 except AttributeError as error:
     raise error
 
@@ -221,8 +221,11 @@ class GGUFLinearMethod(LinearMethodBase):
         self._maybe_tile(layer)
 
     def _maybe_tile(self, layer: torch.nn.Module) -> None:
-        """Replace a Q3_K weight by the tiled layout used by the tensor-core small-batch kernel."""
-        if os.environ.get("GGUF_NO_TILED") or self.layout is not None:
+        """Replace a Q3_K/Q4_K/Q6_K weight by the tiled layout used by the tensor-core small-batch kernel."""
+        # plain linear layers and an untied lm_head (only used for logits); never an embedding table
+        is_linear = type(self) is GGUFLinearMethod
+        is_lm_head = type(layer).__name__ == "ParallelLMHead"
+        if os.environ.get("GGUF_NO_TILED") or self.layout is not None or not (is_linear or is_lm_head):
             return
         weight = layer.weight
         types = {layer.weight_type.shard_weight_type.get(i, layer.weight_type.weight_type) for i in weight.shard_id} or {
@@ -233,10 +236,10 @@ class GGUFLinearMethod(LinearMethodBase):
         wtype = next(iter(types))
         if not can_tile(wtype, weight.data):
             return
-        main, d, rows, cols = repack_q3k(weight.data)
+        main, d, rows, cols = repack(wtype, weight.data)
         weight.data = main
         layer.register_buffer("gguf_tiled_d", d, persistent=False)
-        layer.gguf_tiled = (rows, cols)
+        layer.gguf_tiled = (int(wtype), rows, cols)
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_weight(layer)
@@ -322,7 +325,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         tiled = getattr(layer, "gguf_tiled", None)
         if tiled is not None:
-            out = fused_mul_mat_q3k_tiled(x, layer.weight, layer.gguf_tiled_d, tiled[0], tiled[1])
+            out = fused_mul_mat_tiled(x, layer.weight, layer.gguf_tiled_d, tiled[0], tiled[1], tiled[2])
             if bias is not None:
                 out.add_(bias)
             return out

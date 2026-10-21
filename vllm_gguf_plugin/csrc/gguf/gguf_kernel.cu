@@ -1,4 +1,5 @@
 #include <cuda_fp16.h>
+#include <stdexcept>
 #include <cuda_runtime.h>
 
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
@@ -219,15 +220,30 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
 }
 
 
-// Q3_K on the tiled weight layout (see mmvq_tiled.cuh); Wt is uint8 [tiles * bpr * 16 * 112]
+// ---- tiled weight layouts (see mmvq_tiled.cuh): Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ3_XXS (18), IQ4_XS (23) ----
 template <typename scalar_t>
-static void q3k_tiled_launch(const void * wt, const void * wd, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+static void tiled_mul_launch(int type, const void * wt, const void * wd, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
   const dim3 block_nums((nrows + 15) / 16, (nvecs + 7) / 8, 1);
-  const dim3 block_dims(WARP_SIZE, Q3T_WARPS, 1);
-  mul_mat_q3k_tiled<scalar_t><<<block_nums, block_dims, 0, stream>>>((const uint8_t *) wt, (const uint8_t *) wd, vy, dst, ncols, nrows, nvecs);
+  const uint8_t * w = (const uint8_t *) wt;
+  const uint8_t * d = (const uint8_t *) wd;
+  if (type == 11) {
+    mul_mat_q3k_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q3T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 12) {
+    mul_mat_q4k_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q4T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 13) {
+    mul_mat_q5k_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q5T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 18) {
+    mul_mat_iq3xxs_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, I3T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 23) {
+    mul_mat_iq4xs_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, I4T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 14) {
+    mul_mat_q6k_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q6T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else {
+    throw std::runtime_error("ggml_mul_mat_tiled: unsupported quantization type");
+  }
 }
 
-Tensor ggml_mul_mat_q3k_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t row) {
+Tensor ggml_mul_mat_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t type, int64_t row) {
   int64_t col = X.sizes()[1];
   int64_t vecs = X.sizes()[0];
   const int64_t padded = (col + 512 - 1) / 512 * 512;
@@ -237,30 +253,45 @@ Tensor ggml_mul_mat_q3k_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t row) {
   cudaStream_t stream = get_current_cuda_stream(device_idx);
   Tensor quant_X =
       torch::stable::new_empty(Wt, {vecs, padded / 32 * 9}, ScalarType::Int);
-  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_q3k_tiled", [&] {
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_tiled", [&] {
     quantize_row_q8_1_cuda<scalar_t>(
         (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
-    q3k_tiled_launch<scalar_t>((void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (void*)quant_X.data_ptr(),
+    tiled_mul_launch<scalar_t>((int) type, (void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (void*)quant_X.data_ptr(),
                                (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
   });
   return Y;
 }
 
-
 template <typename scalar_t>
-static void q3k_dequant_launch(const void * wt, const void * wd, scalar_t * out, const int cols, const int rows, cudaStream_t stream) {
+static void tiled_dequant_launch(int type, const void * wt, const void * wd, scalar_t * out, const int cols, const int rows, cudaStream_t stream) {
   const dim3 block_nums((rows + 15) / 16, cols / 256, 1);
-  dequantize_q3k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>((const uint8_t *) wt, (const uint8_t *) wd, out, cols, rows);
+  const uint8_t * w = (const uint8_t *) wt;
+  const uint8_t * d = (const uint8_t *) wd;
+  if (type == 11) {
+    dequantize_q3k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 12) {
+    dequantize_q4k_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 13) {
+    dequantize_q5k_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 18) {
+    dequantize_iq3xxs_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 23) {
+    dequantize_iq4xs_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 14) {
+    dequantize_q6k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
+  } else {
+    throw std::runtime_error("ggml_dequantize_tiled: unsupported quantization type");
+  }
 }
 
-Tensor ggml_dequantize_q3k_tiled(Tensor Wt, Tensor Wd, int64_t rows, int64_t cols, std::optional<ScalarType> dtype) {
+Tensor ggml_dequantize_tiled(Tensor Wt, Tensor Wd, int64_t type, int64_t rows, int64_t cols, std::optional<ScalarType> dtype) {
   const int32_t device_idx = Wt.get_device_index();
   const DeviceGuard device_guard(device_idx);
   const auto dtype_ = dtype.value_or(ScalarType::Half);
   Tensor DW = torch::stable::new_empty(Wt, {rows, cols}, dtype_);
   cudaStream_t stream = get_current_cuda_stream(device_idx);
-  VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize_q3k_tiled", [&] {
-    q3k_dequant_launch<scalar_t>((void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (scalar_t*)DW.data_ptr(), cols, rows, stream);
+  VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize_tiled", [&] {
+    tiled_dequant_launch<scalar_t>((int) type, (void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (scalar_t*)DW.data_ptr(), cols, rows, stream);
   });
   return DW;
 }

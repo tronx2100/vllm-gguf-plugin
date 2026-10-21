@@ -12,9 +12,9 @@ Tensor ggml_dequantize(Tensor W, int64_t type, int64_t m, int64_t n,
                        std::optional<ScalarType> dtype);
 Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row);
-Tensor ggml_mul_mat_q3k_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t row);
-Tensor ggml_dequantize_q3k_tiled(Tensor Wt, Tensor Wd, int64_t rows, int64_t cols,
-                                 std::optional<ScalarType> dtype);
+Tensor ggml_mul_mat_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t type, int64_t row);
+Tensor ggml_dequantize_tiled(Tensor Wt, Tensor Wd, int64_t type, int64_t rows, int64_t cols,
+                             std::optional<ScalarType> dtype);
 Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
                    Tensor expert_ids, Tensor num_tokens_post_padded,
                    int64_t type, int64_t row, int64_t top_k, int64_t tokens);
@@ -31,9 +31,10 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "-> Tensor");
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
-  ops.def("ggml_mul_mat_q3k_tiled(Tensor Wt, Tensor Wd, Tensor X, SymInt row) -> Tensor");
   ops.def(
-      "ggml_dequantize_q3k_tiled(Tensor Wt, Tensor Wd, SymInt rows, SymInt cols, "
+      "ggml_mul_mat_tiled(Tensor Wt, Tensor Wd, Tensor X, int type, SymInt row) -> Tensor");
+  ops.def(
+      "ggml_dequantize_tiled(Tensor Wt, Tensor Wd, int type, SymInt rows, SymInt cols, "
       "ScalarType? dtype) -> Tensor");
   ops.def(
       "ggml_moe_a8(Tensor X, Tensor W, "
@@ -51,8 +52,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
-  ops.impl("ggml_mul_mat_q3k_tiled", TORCH_BOX(&ggml_mul_mat_q3k_tiled));
-  ops.impl("ggml_dequantize_q3k_tiled", TORCH_BOX(&ggml_dequantize_q3k_tiled));
+  ops.impl("ggml_mul_mat_tiled", TORCH_BOX(&ggml_mul_mat_tiled));
+  ops.impl("ggml_dequantize_tiled", TORCH_BOX(&ggml_dequantize_tiled));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
 }
