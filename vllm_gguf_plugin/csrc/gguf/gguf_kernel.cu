@@ -13,6 +13,7 @@
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
 #include "mmvq.cuh"
+#include "mmvq_tiled.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
@@ -215,6 +216,53 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
     }
   });
   return Y;
+}
+
+
+// Q3_K on the tiled weight layout (see mmvq_tiled.cuh); Wt is uint8 [tiles * bpr * 16 * 112]
+template <typename scalar_t>
+static void q3k_tiled_launch(const void * wt, const void * wd, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+  const dim3 block_nums((nrows + 15) / 16, (nvecs + 7) / 8, 1);
+  const dim3 block_dims(WARP_SIZE, Q3T_WARPS, 1);
+  mul_mat_q3k_tiled<scalar_t><<<block_nums, block_dims, 0, stream>>>((const uint8_t *) wt, (const uint8_t *) wd, vy, dst, ncols, nrows, nvecs);
+}
+
+Tensor ggml_mul_mat_q3k_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t row) {
+  int64_t col = X.sizes()[1];
+  int64_t vecs = X.sizes()[0];
+  const int64_t padded = (col + 512 - 1) / 512 * 512;
+  const int32_t device_idx = X.get_device_index();
+  const DeviceGuard device_guard(device_idx);
+  Tensor Y = torch::stable::new_zeros(Wt, {vecs, row}, X.scalar_type());
+  cudaStream_t stream = get_current_cuda_stream(device_idx);
+  Tensor quant_X =
+      torch::stable::new_empty(Wt, {vecs, padded / 32 * 9}, ScalarType::Int);
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_q3k_tiled", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    q3k_tiled_launch<scalar_t>((void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (void*)quant_X.data_ptr(),
+                               (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+  });
+  return Y;
+}
+
+
+template <typename scalar_t>
+static void q3k_dequant_launch(const void * wt, const void * wd, scalar_t * out, const int cols, const int rows, cudaStream_t stream) {
+  const dim3 block_nums((rows + 15) / 16, cols / 256, 1);
+  dequantize_q3k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>((const uint8_t *) wt, (const uint8_t *) wd, out, cols, rows);
+}
+
+Tensor ggml_dequantize_q3k_tiled(Tensor Wt, Tensor Wd, int64_t rows, int64_t cols, std::optional<ScalarType> dtype) {
+  const int32_t device_idx = Wt.get_device_index();
+  const DeviceGuard device_guard(device_idx);
+  const auto dtype_ = dtype.value_or(ScalarType::Half);
+  Tensor DW = torch::stable::new_empty(Wt, {rows, cols}, dtype_);
+  cudaStream_t stream = get_current_cuda_stream(device_idx);
+  VLLM_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize_q3k_tiled", [&] {
+    q3k_dequant_launch<scalar_t>((void*)Wt.data_ptr(), (void*)Wd.data_ptr(), (scalar_t*)DW.data_ptr(), cols, rows, stream);
+  });
+  return DW;
 }
 
 Tensor ggml_mul_mat_a8(Tensor W,  // quant weight

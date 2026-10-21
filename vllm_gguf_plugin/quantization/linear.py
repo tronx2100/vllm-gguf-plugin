@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
@@ -13,6 +15,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
 from .layout import GGUFLinearLayout
+from .tiled import Q3T_MAX_TOKENS, can_tile, repack_q3k
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
@@ -86,6 +89,23 @@ def _fused_mul_mat_gguf(
     return y
 
 
+def _fused_mul_mat_q3k_tiled(
+    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return torch.empty(0, rows, dtype=x.dtype, device=x.device)
+    if x.shape[0] <= Q3T_MAX_TOKENS:
+        return torch.ops._C_gguf.ggml_mul_mat_q3k_tiled(wt, wd, x, rows)
+    w = torch.ops._C_gguf.ggml_dequantize_q3k_tiled(wt, wd, rows, cols, x.dtype)
+    return x @ w.T
+
+
+def _fused_mul_mat_q3k_tiled_fake(
+    x: torch.Tensor, wt: torch.Tensor, wd: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], rows, dtype=x.dtype, device=x.device)
+
+
 def _fused_mul_mat_gguf_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -93,6 +113,16 @@ def _fused_mul_mat_gguf_fake(
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
+
+try:
+    direct_register_custom_op(
+        op_name="_fused_mul_mat_q3k_tiled",
+        op_func=_fused_mul_mat_q3k_tiled,
+        fake_impl=_fused_mul_mat_q3k_tiled_fake,
+    )
+    fused_mul_mat_q3k_tiled = torch.ops.vllm._fused_mul_mat_q3k_tiled
+except AttributeError as error:
+    raise error
 
 try:
     direct_register_custom_op(
@@ -188,6 +218,25 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._maybe_tile(layer)
+
+    def _maybe_tile(self, layer: torch.nn.Module) -> None:
+        """Replace a Q3_K weight by the tiled layout used by the tensor-core small-batch kernel."""
+        if os.environ.get("GGUF_NO_TILED") or self.layout is not None:
+            return
+        weight = layer.weight
+        types = {layer.weight_type.shard_weight_type.get(i, layer.weight_type.weight_type) for i in weight.shard_id} or {
+            layer.weight_type.weight_type
+        }
+        if len(types) != 1:
+            return
+        wtype = next(iter(types))
+        if not can_tile(wtype, weight.data):
+            return
+        main, d, rows, cols = repack_q3k(weight.data)
+        weight.data = main
+        layer.register_buffer("gguf_tiled_d", d, persistent=False)
+        layer.gguf_tiled = (rows, cols)
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_weight(layer)
@@ -270,6 +319,13 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if self.layout is not None:
             x = self.layout.input_to_gguf(x)
+
+        tiled = getattr(layer, "gguf_tiled", None)
+        if tiled is not None:
+            out = fused_mul_mat_q3k_tiled(x, layer.weight, layer.gguf_tiled_d, tiled[0], tiled[1])
+            if bias is not None:
+                out.add_(bias)
+            return out
 
         shard_id = layer.weight.shard_id
         if shard_id:
