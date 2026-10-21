@@ -396,6 +396,44 @@ struct Q4KOp {
     }
 };
 
+
+struct Q3KOp {
+    struct State { int vi[QR3_K]; int sc[QR3_K]; float d; int bq8_offset; };
+    static __device__ __forceinline__ void decode(const block_q3_K * bq3_K, const int iqs, State & st) {
+        st.bq8_offset = QR3_K * (iqs / (QI3_K/2));
+        const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+        st.d = __half2float(bq3_K->d);
+        const int vl = get_int_from_uint8(bq3_K->qs, iqs);
+        // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+        const int vh = ~get_int_from_uint8(bq3_K->hmask, iqs % (QI3_K/2)) >> st.bq8_offset;
+        const uint8_t * scales = bq3_K->scales;
+#pragma unroll
+        for (int i = 0; i < QR3_K; ++i) {
+            const int isc = scale_offset + 2*i;
+            const int isc_low = isc % (QK_K/32);
+            const int sc_shift_low = 4 * (isc / (QK_K/32));
+            const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
+            const int isc_high = isc % (QK_K/64);
+            const int sc_shift_high = 2 * (isc / (QK_K/64));
+            const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
+            st.sc[i] = (sc_low | sc_high) - 32;
+            const int vil = (vl >> (2*i)) & 0x03030303;
+            const int vih = ((vh >> i) << 2) & 0x04040404;
+            st.vi[i] = __vsubss4(vil, vih);
+        }
+    }
+    static __device__ __forceinline__ float dot(const State & st, const block_q8_1 * bq8_1, const int iqs) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR3_K; ++i) {
+            const int u = get_int_from_int8_aligned(bq8_1[st.bq8_offset + i].qs, iqs % QI8_1);
+            const float d8 = __low2float(bq8_1[st.bq8_offset + i].ds);
+            sumf += d8 * (__dp4a(st.vi[i], u, 0) * st.sc[i]);
+        }
+        return st.d * sumf;
+    }
+};
+
 struct IQ3SOp {
     struct State { int gl[4]; int gh[4]; float dx; };
     static __device__ __forceinline__ void decode(const block_iq3_s * bq2, const int ib32, State & st) {
@@ -501,11 +539,7 @@ static void mul_mat_vec_q2_K_q8_1_cuda(const void * vx, const void * vy, scalar_
 
 template<typename scalar_t>
 static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, (nvecs + MMVQ_VECS - 1) / MMVQ_VECS, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_op_cuda<scalar_t, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, Q3KOp>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
