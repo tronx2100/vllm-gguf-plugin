@@ -86,8 +86,27 @@ def _patch_engine_args() -> None:
         if self.speculative_config is not None:
             configured_model = configured_model or self.speculative_config.get("model")
 
-        config = original_create_speculative_config(self, *args, **kwargs)
         gguf_model = self.model_weights
+        target_model_config = args[0] if args else kwargs.get("target_model_config")
+        if (
+            self.speculative_config is not None
+            and configured_model is None
+            and target_model_config is not None
+            and _is_gguf_reference(gguf_model)
+            and str(self.speculative_config.get("method", "")) in ("mtp",)
+            and not _is_gguf_reference(target_model_config.model)
+        ):
+            # The draft ModelConfig is built from model_weights (the .gguf file),
+            # whose config source would be the GGUF folder (usually no config.json).
+            # Use the same config source as the target (base model repo) instead.
+            self.speculative_config = {
+                **self.speculative_config,
+                "model": target_model_config.model,
+                "quantization": self.speculative_config.get("quantization")
+                or target_model_config.quantization,
+            }
+
+        config = original_create_speculative_config(self, *args, **kwargs)
         if (
             config is not None
             and config.method == "mtp"
