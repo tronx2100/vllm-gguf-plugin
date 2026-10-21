@@ -215,6 +215,162 @@ static __global__ void mul_mat_vec_iq4_xs_multi(const void * __restrict__ vx, co
     }
 }
 
+
+// Generic multi-vector kernel for formats whose per-thread weight decode is split into
+// Op::decode (weights only, done once) and Op::dot (per input vector).
+template <typename scalar_t, int NV, int qk, int qi, typename block_q_t, int vdr, typename Op>
+static __global__ void mul_mat_vec_q_op_multi(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows, const int nvecs) {
+    const auto row = blockIdx.x*blockDim.y + threadIdx.y;
+    const int vec0 = blockIdx.y*NV;
+
+    if (row >= nrows || vec0 >= nvecs) {
+        return;
+    }
+    const int nv = min(NV, nvecs - vec0);
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+
+    float tmp[NV];
+#pragma unroll
+    for (int v = 0; v < NV; ++v) {
+        tmp[v] = 0.0f;
+    }
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (auto i = threadIdx.x / (qi/vdr); i < blocks_per_row; i += blocks_per_warp) {
+        const int iqs = vdr * (threadIdx.x % (qi/vdr));
+        typename Op::State st;
+        Op::decode(&x[row*blocks_per_row + i], iqs, st);
+#pragma unroll
+        for (int v = 0; v < NV; ++v) {
+            if (v < nv) {
+                tmp[v] += Op::dot(st, &y[(vec0 + v)*(nrows_y/QK8_1) + i * (qk/QK8_1)], iqs);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int v = 0; v < NV; ++v) {
+#pragma unroll
+        for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+            tmp[v] += VLLM_SHFL_XOR_SYNC(tmp[v], mask);
+        }
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int v = 0; v < NV; ++v) {
+            if (v < nv) {
+                dst[(vec0 + v)*nrows + row] = tmp[v];
+            }
+        }
+    }
+}
+
+struct Q6KOp {
+    struct State { int vi[QR6_K]; int sc[QR6_K]; float d; int bq8_offset; };
+    static __device__ __forceinline__ void decode(const block_q6_K * bq6_K, const int iqs, State & st) {
+        st.bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+        const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+        const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+        const int vl = get_int_from_uint8(bq6_K->ql, iqs);
+        const int vh = get_int_from_uint8(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+        const int8_t * scales = bq6_K->scales + scale_offset;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int vil = (vl >> (4*i)) & 0x0F0F0F0F;
+            const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
+            st.vi[i] = __vsubss4((vil | vih), 0x20202020);
+            st.sc[i] = scales[4*i];
+        }
+        st.d = __half2float(bq6_K->d);
+    }
+    static __device__ __forceinline__ float dot(const State & st, const block_q8_1 * bq8_1, const int iqs) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            const int u = get_int_from_int8_aligned(bq8_1[st.bq8_offset + 2*i].qs, iqs % QI8_1);
+            const float d8 = __low2float(bq8_1[st.bq8_offset + 2*i].ds);
+            sumf += d8 * (__dp4a(st.vi[i], u, 0) * st.sc[i]);
+        }
+        return st.d * sumf;
+    }
+};
+
+struct Q5KOp {
+    struct State { int v0[QR5_K]; int v1[QR5_K]; uint8_t sc[QR5_K]; uint8_t m[QR5_K]; half2 dm; int bq8_offset; };
+    static __device__ __forceinline__ void decode(const block_q5_K * bq5_K, const int iqs, State & st) {
+        st.bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+        const int * ql = (const int *)(bq5_K->qs + 16 * st.bq8_offset + 4 * ((iqs/2)%4));
+        const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+        const int vl0 = ql[0], vl1 = ql[4];
+        const int vh0 = qh[0] >> st.bq8_offset, vh1 = qh[4] >> st.bq8_offset;
+        const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+        uint16_t aux[2];
+        const int j = st.bq8_offset/2;
+        if (j < 2) {
+            aux[0] = scales[j+0] & 0x3f3f;
+            aux[1] = scales[j+2] & 0x3f3f;
+        } else {
+            aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+            aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+        }
+        const uint8_t * sc = (const uint8_t *)aux;
+        const uint8_t * m  = sc + 2;
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            st.v0[i] = ((vl0 >> (4*i)) & 0x0F0F0F0F) | (((vh0 >> i) << 4) & 0x10101010);
+            st.v1[i] = ((vl1 >> (4*i)) & 0x0F0F0F0F) | (((vh1 >> i) << 4) & 0x10101010);
+            st.sc[i] = sc[i];
+            st.m[i] = m[i];
+        }
+        st.dm = bq5_K->dm;
+    }
+    static __device__ __forceinline__ float dot(const State & st, const block_q8_1 * bq8_1, const int iqs) {
+        float sumf_d = 0.0f;
+        float sumf_m = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1 * bq8i = bq8_1 + st.bq8_offset + i;
+            const float d8 = __low2float(bq8i->ds);
+            const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+            const int u0 = q8[0], u1 = q8[4];
+            const int dot1 = __dp4a(st.v0[i], u0, __dp4a(st.v1[i], u1, 0));
+            const int dot2 = __dp4a(0x01010101, u0, __dp4a(0x01010101, u1, 0));
+            sumf_d += d8 * (dot1 * st.sc[i]);
+            sumf_m += d8 * (dot2 * st.m[i]);
+        }
+        const float2 dm5f = __half22float2(st.dm);
+        return dm5f.x*sumf_d - dm5f.y*sumf_m;
+    }
+};
+
+template<typename scalar_t, int NV, int qk, int qi, typename block_q_t, int vdr, typename Op>
+static void mul_mat_vec_q_op_launch(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+    const dim3 block_nums(block_num_y, (nvecs + NV - 1) / NV, 1);
+    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+    mul_mat_vec_q_op_multi<scalar_t, NV, qk, qi, block_q_t, vdr, Op>
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+}
+
+template<typename scalar_t, int qk, int qi, typename block_q_t, int vdr, typename Op>
+static void mul_mat_vec_q_op_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+    if (nvecs == 1) {
+        mul_mat_vec_q_op_launch<scalar_t, 1, qk, qi, block_q_t, vdr, Op>(vx, vy, dst, ncols, nrows, nvecs, stream);
+    } else if (nvecs == 2) {
+        mul_mat_vec_q_op_launch<scalar_t, 2, qk, qi, block_q_t, vdr, Op>(vx, vy, dst, ncols, nrows, nvecs, stream);
+    } else if (nvecs <= 4) {
+        mul_mat_vec_q_op_launch<scalar_t, 4, qk, qi, block_q_t, vdr, Op>(vx, vy, dst, ncols, nrows, nvecs, stream);
+    } else {
+        mul_mat_vec_q_op_launch<scalar_t, 8, qk, qi, block_q_t, vdr, Op>(vx, vy, dst, ncols, nrows, nvecs, stream);
+    }
+}
+
 template<typename scalar_t>
 static void mul_mat_vec_q4_0_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -289,20 +445,12 @@ static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_
 
 template<typename scalar_t>
 static void mul_mat_vec_q5_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, (nvecs + MMVQ_VECS - 1) / MMVQ_VECS, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_op_cuda<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, Q5KOp>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
 static void mul_mat_vec_q6_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, (nvecs + MMVQ_VECS - 1) / MMVQ_VECS, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_op_cuda<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, Q6KOp>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>

@@ -37,13 +37,9 @@ def _fused_mul_mat_gguf(
 ) -> torch.Tensor:
     if weight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if weight.shape[0] > 5120 else 16
-    elif weight.shape[0] > 100_000 and weight_type in MMQ_QUANT_TYPES:
-        mmvq_safe = 0  # vocabulary-sized matrices (lm_head): MMQ wins even for one token
-    elif weight_type == WeightType.Q6_K:
-        mmvq_safe = 2 if weight.shape[0] > 5120 else 6
     else:
-        # the multi-vector mmvq kernel beats MMQ up to ~5 tokens (speculative verify steps)
-        mmvq_safe = 5 if weight.shape[0] > 5120 else 6
+        # multi-vector mmvq kernels (several tokens per weight read) beat MMQ up to 8 tokens
+        mmvq_safe = 8
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type in UNQUANTIZED_TYPES:
