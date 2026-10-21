@@ -268,17 +268,17 @@ static void tiled_dequant_launch(int type, const void * wt, const void * wd, sca
   const uint8_t * w = (const uint8_t *) wt;
   const uint8_t * d = (const uint8_t *) wd;
   if (type == 11) {
-    dequantize_q3k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
+    dequantize_tiled_fast<scalar_t, DqQ3K><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 12) {
-    dequantize_q4k_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+    dequantize_tiled_fast<scalar_t, DqQ4K><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 13) {
-    dequantize_q5k_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+    dequantize_tiled_fast<scalar_t, DqQ5K><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 14) {
+    dequantize_tiled_fast<scalar_t, DqQ6K><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 18) {
-    dequantize_iq3xxs_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+    dequantize_tiled_fast<scalar_t, DqIQ3XXS><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 23) {
     dequantize_iq4xs_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
-  } else if (type == 14) {
-    dequantize_q6k_tiled<scalar_t><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else {
     throw std::runtime_error("ggml_dequantize_tiled: unsupported quantization type");
   }

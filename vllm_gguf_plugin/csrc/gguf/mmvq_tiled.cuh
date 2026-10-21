@@ -1105,3 +1105,93 @@ static __global__ void dequantize_iq3xxs_tiled(const uint8_t * __restrict__ wt, 
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Fast dequantization of the tiled layouts: one block per (tile, superblock) stages the tile in shared
+// memory with 16-byte loads, then thread c writes element c of every row (coalesced 2-byte stores).
+struct DqQ3K {
+    static constexpr int ROWB = Q3T_ROWB, TILE = Q3T_TILE_BYTES, DB = Q3T_D_BYTES;
+    static __device__ __forceinline__ float val(const uint8_t * blk, const uint8_t * dpl, const int r, const int c) {
+        const int s = c >> 4, k = c & 15;
+        const int grp = s >> 1, half_ = grp >> 2, j = grp & 3;
+        const int pos = (s & 1) * 16 + k;
+        const int q = (blk[32 + half_ * 32 + pos] >> (2 * j)) & 3;
+        const int h = (blk[pos] >> grp) & 1;
+        const float d = __half2float(((const half *) dpl)[r]);
+        return d * ((const int8_t *) (blk + 96))[s] * (q - (h ? 0 : 4));
+    }
+};
+struct DqQ4K {
+    static constexpr int ROWB = Q4T_ROWB, TILE = Q4T_TILE_BYTES, DB = Q4T_D_BYTES;
+    static __device__ __forceinline__ float val(const uint8_t * blk, const uint8_t * dpl, const int r, const int c) {
+        const int j = c >> 5, k = c & 31;
+        const int b = blk[32 * (j >> 1) + k];
+        const int q = (j & 1) ? (b >> 4) : (b & 15);
+        const half2 dm = ((const half2 *) dpl)[r];
+        return __low2float(dm) * blk[128 + j] * q - __high2float(dm) * blk[136 + j];
+    }
+};
+struct DqQ5K {
+    static constexpr int ROWB = Q5T_ROWB, TILE = Q5T_TILE_BYTES, DB = Q5T_D_BYTES;
+    static __device__ __forceinline__ float val(const uint8_t * blk, const uint8_t * dpl, const int r, const int c) {
+        const int j = c >> 5, k = c & 31;
+        const int b = blk[32 * (j >> 1) + k];
+        const int q = ((j & 1) ? (b >> 4) : (b & 15)) | (((blk[128 + k] >> j) & 1) << 4);
+        const half2 dm = ((const half2 *) dpl)[r];
+        return __low2float(dm) * blk[160 + j] * q - __high2float(dm) * blk[168 + j];
+    }
+};
+struct DqQ6K {
+    static constexpr int ROWB = Q6T_ROWB, TILE = Q6T_TILE_BYTES, DB = Q6T_D_BYTES;
+    static __device__ __forceinline__ float val(const uint8_t * blk, const uint8_t * dpl, const int r, const int c) {
+        const int s = c >> 4;
+        const int h = s >> 3, lh = s & 1, u = (s >> 1) & 3;
+        const int l = 16 * lh + (c & 15);
+        const int qlb = blk[h * 64 + (u & 1) * 32 + l];
+        const int nib = (u < 2) ? (qlb & 15) : (qlb >> 4);
+        const int hi = (blk[128 + h * 32 + l] >> (2 * u)) & 3;
+        const float d = __half2float(((const half *) dpl)[r]);
+        return d * ((const int8_t *) (blk + 192))[s] * ((nib | (hi << 4)) - 32);
+    }
+};
+struct DqIQ3XXS {
+    static constexpr int ROWB = I3T_ROWB, TILE = I3T_TILE_BYTES, DB = I3T_D_BYTES;
+    static __device__ __forceinline__ float val(const uint8_t * blk, const uint8_t * dpl, const int r, const int c) {
+        const int j = c >> 5, w = (c & 31) >> 2, b4 = c & 3;
+        const uint32_t aux32 = ((const uint32_t *) (blk + 64))[j];
+        const uint32_t grid = iq3xxs_grid[blk[8 * j + w]];
+        const uint32_t * signs = (const uint32_t *) (ksigns64 + ((aux32 >> (7 * (w >> 1))) & 127));
+        const uint32_t sg = signs[w & 1];
+        const int v = __vsub4(grid ^ sg, sg);
+        const float d = __half2float(((const half *) dpl)[r]) * 0.25f * (1 + 2 * (int) (aux32 >> 28));
+        return d * (float) ((int8_t) ((v >> (8 * b4)) & 0xFF));
+    }
+};
+
+template <typename scalar_t, typename Fmt>
+static __global__ void dequantize_tiled_fast(const uint8_t * __restrict__ wt, const uint8_t * __restrict__ wd, scalar_t * __restrict__ out, const int cols, const int rows) {
+    __shared__ __align__(16) uint8_t sm[Fmt::TILE + Fmt::DB];
+    const int tile = blockIdx.x;
+    const int i = blockIdx.y;
+    const int bpr = cols / 256;
+    const uint4 * src = (const uint4 *) (wt + ((size_t) tile * bpr + i) * Fmt::TILE);
+    const uint4 * dsrc = (const uint4 *) (wd + ((size_t) tile * bpr + i) * Fmt::DB);
+    uint4 * dst = (uint4 *) sm;
+    for (int o = threadIdx.x; o < Fmt::TILE / 16; o += blockDim.x) {
+        dst[o] = src[o];
+    }
+    if (threadIdx.x < Fmt::DB / 16) {
+        dst[Fmt::TILE / 16 + threadIdx.x] = dsrc[threadIdx.x];
+    }
+    __syncthreads();
+    const int c = threadIdx.x;      // 0..255
+    const uint8_t * dpl = sm + Fmt::TILE;
+#pragma unroll 4
+    for (int r = 0; r < 16; ++r) {
+        const int row = tile * 16 + r;
+        if (row < rows) {
+            out[(size_t) row * cols + i * 256 + c] = (scalar_t) Fmt::val(sm + r * Fmt::ROWB, dpl, r, c);
+        }
+    }
+}

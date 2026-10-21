@@ -9,7 +9,7 @@ The tiled tensors replace the original GGUF tensor.
 import torch
 from gguf import GGMLQuantizationType as WeightType
 
-TILED_MAX_TOKENS = 16     # up to this many tokens the tiled mma kernel is used, above it dequantize + GEMM
+TILED_MAX_TOKENS = 64     # up to this many tokens the tiled mma kernel is used (measured: faster than dequantize + GEMM below ~100), above it dequantize + GEMM
 
 # type -> bytes of the GGUF block
 _BLOCK_BYTES = {
