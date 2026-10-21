@@ -1,4 +1,4 @@
-# vLLM GGUF Quantization Plugin
+# vLLM GGUF Quantization Plugin - Forked
 
 This plugin provides out-of-tree GGUF quantization support for vLLM after
 in-tree support deprecation
