@@ -249,7 +249,8 @@ Tensor ggml_mul_mat_tiled(Tensor Wt, Tensor Wd, Tensor X, int64_t type, int64_t 
   const int64_t padded = (col + 512 - 1) / 512 * 512;
   const int32_t device_idx = X.get_device_index();
   const DeviceGuard device_guard(device_idx);
-  Tensor Y = torch::stable::new_zeros(Wt, {vecs, row}, X.scalar_type());
+  // every output element is written by the kernel, no need to zero the buffer (saves a memset per matmul)
+  Tensor Y = torch::stable::new_empty(Wt, {vecs, row}, X.scalar_type());
   cudaStream_t stream = get_current_cuda_stream(device_idx);
   Tensor quant_X =
       torch::stable::new_empty(Wt, {vecs, padded / 32 * 9}, ScalarType::Int);
