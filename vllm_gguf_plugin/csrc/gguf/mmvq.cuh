@@ -349,6 +349,80 @@ struct Q5KOp {
     }
 };
 
+
+struct Q4KOp {
+    struct State { int v0[QR4_K]; int v1[QR4_K]; uint8_t sc[QR4_K]; uint8_t m[QR4_K]; half2 dm; int bq8_offset; };
+    static __device__ __forceinline__ void decode(const block_q4_K * bq4_K, const int iqs, State & st) {
+        st.bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+        const int * q4 = (const int *)(bq4_K->qs + 16 * st.bq8_offset + 4 * ((iqs/2)%4));
+        const int vq0 = q4[0], vq1 = q4[4];
+        const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+        uint16_t aux[2];
+        const int j = st.bq8_offset/2;
+        if (j < 2) {
+            aux[0] = scales[j+0] & 0x3f3f;
+            aux[1] = scales[j+2] & 0x3f3f;
+        } else {
+            aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+            aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
+        }
+        const uint8_t * sc = (const uint8_t *)aux;
+        const uint8_t * m  = sc + 2;
+#pragma unroll
+        for (int i = 0; i < QR4_K; ++i) {
+            st.v0[i] = (vq0 >> (4*i)) & 0x0F0F0F0F;
+            st.v1[i] = (vq1 >> (4*i)) & 0x0F0F0F0F;
+            st.sc[i] = sc[i];
+            st.m[i] = m[i];
+        }
+        st.dm = bq4_K->dm;
+    }
+    static __device__ __forceinline__ float dot(const State & st, const block_q8_1 * bq8_1, const int iqs) {
+        float sumf_d = 0.0f;
+        float sumf_m = 0.0f;
+#pragma unroll
+        for (int i = 0; i < QR4_K; ++i) {
+            const block_q8_1 * bq8i = bq8_1 + st.bq8_offset + i;
+            const float d8 = __low2float(bq8i->ds);
+            const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+            const int u0 = q8[0], u1 = q8[4];
+            const int dot1 = __dp4a(st.v1[i], u1, __dp4a(st.v0[i], u0, 0));
+            const int dot2 = __dp4a(0x01010101, u1, __dp4a(0x01010101, u0, 0));
+            sumf_d += d8 * (dot1 * st.sc[i]);
+            sumf_m += d8 * (dot2 * st.m[i]);
+        }
+        const float2 dm4f = __half22float2(st.dm);
+        return dm4f.x*sumf_d - dm4f.y*sumf_m;
+    }
+};
+
+struct IQ3SOp {
+    struct State { int gl[4]; int gh[4]; float dx; };
+    static __device__ __forceinline__ void decode(const block_iq3_s * bq2, const int ib32, State & st) {
+        const uint8_t * qs = bq2->qs + 8*ib32;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t * grid1 = iq3xs_grid + (qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256));
+            const uint32_t * grid2 = iq3xs_grid + (qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256));
+            uint32_t signs0 = __vcmpeq4(((bq2->signs[4*ib32+l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+            uint32_t signs1 = __vcmpeq4(((bq2->signs[4*ib32+l] >>  4) * 0x01010101) & 0x08040201, 0x08040201);
+            st.gl[l] = __vsub4(grid1[0] ^ signs0, signs0);
+            st.gh[l] = __vsub4(grid2[0] ^ signs1, signs1);
+        }
+        st.dx = __half2float(bq2->d) * (0.5f + ((bq2->scales[ib32/2] >> 4*(ib32%2)) & 0xf)) * 0.5f;
+    }
+    static __device__ __forceinline__ float dot(const State & st, const block_q8_1 * bq8_1, const int ib32) {
+        const int * q8 = (const int *) bq8_1[ib32].qs;
+        int sumi = 0;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            sumi = __dp4a(st.gl[l], q8[2*l+0], sumi);
+            sumi = __dp4a(st.gh[l], q8[2*l+1], sumi);
+        }
+        return st.dx * __low2float(bq8_1[ib32].ds) * sumi;
+    }
+};
+
 template<typename scalar_t, int NV, int qk, int qi, typename block_q_t, int vdr, typename Op>
 static void mul_mat_vec_q_op_launch(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
@@ -436,11 +510,7 @@ static void mul_mat_vec_q3_K_q8_1_cuda(const void * vx, const void * vy, scalar_
 
 template<typename scalar_t>
 static void mul_mat_vec_q4_K_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, (nvecs + MMVQ_VECS - 1) / MMVQ_VECS, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_op_cuda<scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, Q4KOp>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
 
 template<typename scalar_t>
@@ -553,9 +623,5 @@ static void mul_mat_vec_iq4_xs_q8_1_cuda(const void * vx, const void * vy, scala
 
 template<typename scalar_t>
 static void mul_mat_vec_iq3_s_q8_1_cuda(const void * vx, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-    const dim3 block_nums(block_num_y, (nvecs + MMVQ_VECS - 1) / MMVQ_VECS, 1);
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-    mul_mat_vec_q<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, vec_dot_iq3_s_q8_1>
-        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);
+    mul_mat_vec_q_op_cuda<scalar_t, QK_K, QI3_XS, block_iq3_s, 1, IQ3SOp>(vx, vy, dst, ncols, nrows, nvecs, stream);
 }
