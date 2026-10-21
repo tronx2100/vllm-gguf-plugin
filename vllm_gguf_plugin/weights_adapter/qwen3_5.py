@@ -407,11 +407,14 @@ class Qwen35MtpGGUFAdapter(BaseGGUFWeightsAdapter):
             )
         tensor_names = sorted(get_gguf_tensor_names(files.backbone))
         logger.info("Loading Qwen3.5 MTP draft from GGUF block %d", block_index)
-        mapper = build_qwen35_mtp_mapper(
-            block_index,
-            is_moe=model_config.hf_config.model_type in QWEN35_MOE_MTP_MODEL_TYPES,
-        )
         block_prefix = f"blk.{block_index}."
+        # The draft hf_config model_type is not always the *_moe_mtp one, so also
+        # detect a MoE block from its tensor names (stacked experts / router).
+        is_moe = model_config.hf_config.model_type in QWEN35_MOE_MTP_MODEL_TYPES or any(
+            name.startswith(block_prefix) and ("_exps." in name or ".ffn_gate_inp." in name)
+            for name in tensor_names
+        )
+        mapper = build_qwen35_mtp_mapper(block_index, is_moe=is_moe)
         name_map: dict[str, str] = {}
         unmapped: list[str] = []
         for name in tensor_names:
