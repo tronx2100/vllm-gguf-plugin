@@ -224,6 +224,20 @@ class GGUFLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # The GGUF kernels work on [tokens, features]; vision encoders pass
+        # e.g. [seq, 1, features]. Flatten the leading dims and restore them.
+        if x.dim() != 2:
+            lead = x.shape[:-1]
+            out = self._apply_2d(layer, x.reshape(-1, x.shape[-1]), bias)
+            return out.reshape(*lead, out.shape[-1])
+        return self._apply_2d(layer, x, bias)
+
+    def _apply_2d(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
         if self.layout is not None:
