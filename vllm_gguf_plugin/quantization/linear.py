@@ -53,6 +53,11 @@ _MMQ_QI = {
 }
 
 
+# MMQ is slow for large batches (e.g. 3.9 ms vs 31.8 ms for a 10240 x 5120 Q4_K matrix at 1500 tokens):
+# above this many tokens dequantize + a regular fp16 GEMM is used instead.
+MMQ_MAX_TOKENS = 16
+
+
 def _mmq_row_aligned(weight: torch.Tensor, weight_type: int) -> bool:
     qi = _MMQ_QI.get(WeightType(weight_type))
     if qi is None:
@@ -76,7 +81,11 @@ def _fused_mul_mat_gguf(
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
-    elif weight_type in MMQ_QUANT_TYPES and _mmq_row_aligned(weight, weight_type):
+    elif (
+        weight_type in MMQ_QUANT_TYPES
+        and x.shape[0] <= MMQ_MAX_TOKENS
+        and _mmq_row_aligned(weight, weight_type)
+    ):
         y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
