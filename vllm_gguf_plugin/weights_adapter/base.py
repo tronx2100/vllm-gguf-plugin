@@ -28,6 +28,17 @@ class BaseGGUFWeightsAdapter(ABC):
     #: model in speculative decoding) and must stay unquantized.
     extra_unquantized_modules: tuple[str, ...] = ()
 
+    def dense_modules(
+        self,
+        files: GGUFModelFiles,
+        name_map: dict[str, str],
+    ) -> tuple[str, ...]:
+        """Modules whose quantized GGUF weights are dequantized while loading and
+        then treated as unquantized (e.g. one shard of a fused layer is F32 while
+        the other one is quantized)."""
+        del files, name_map
+        return ()
+
     @classmethod
     @abstractmethod
     def matches(cls, config: PretrainedConfig) -> bool:

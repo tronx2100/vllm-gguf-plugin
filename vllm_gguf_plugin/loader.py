@@ -173,8 +173,10 @@ class GGUFModelLoader(BaseModelLoader):
         )
 
         name_map = adapter.build_name_map(files, model_config)
-        unquantized_modules = _get_unquantized_modules(files, name_map) + tuple(
-            adapter.extra_unquantized_modules
+        unquantized_modules = (
+            _get_unquantized_modules(files, name_map)
+            + tuple(adapter.extra_unquantized_modules)
+            + tuple(adapter.dense_modules(files, name_map))
         )
         linear_layouts = adapter.get_linear_layouts(files, model_config, name_map)
         return adapter, GGUFLoadPlan(

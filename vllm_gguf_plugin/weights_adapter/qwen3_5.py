@@ -263,6 +263,41 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
             )
         return name_map
 
+    _DENSE_MODULES: frozenset[str] = frozenset()
+
+    def dense_modules(
+        self,
+        files: GGUFModelFiles,
+        name_map: dict[str, str],
+    ) -> tuple[str, ...]:
+        """in_proj_a/in_proj_b are fused (in_proj_ba) and must share one precision.
+        Some GGUFs store one as F32 and the other quantized (e.g. Q8_0): dequantize
+        the quantized one and treat both as unquantized."""
+        unquantized = {"F32", "F16", "BF16"}
+        groups: dict[str, dict[str, bool]] = {}
+        for gguf_file in files.all_files:
+            for tensor in gguf.GGUFReader(gguf_file).tensors:
+                mapped = name_map.get(tensor.name)
+                if mapped is None or not mapped.endswith(
+                    ("linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight")
+                ):
+                    continue
+                base = mapped.removesuffix(".weight")
+                groups.setdefault(base.rsplit(".in_proj_", 1)[0], {})[base] = (
+                    tensor.tensor_type.name not in unquantized
+                )
+        dense: set[str] = set()
+        for shards in groups.values():
+            if len(set(shards.values())) > 1:
+                dense.update(base for base, quantized in shards.items() if quantized)
+        if dense:
+            logger.info(
+                "Dequantizing %d mixed-precision in_proj_a/in_proj_b weight(s)",
+                len(dense),
+            )
+        self._DENSE_MODULES = frozenset(dense)
+        return tuple(sorted(dense))
+
     def get_linear_layouts(
         self,
         files: GGUFModelFiles,
@@ -336,10 +371,22 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         def transformed() -> Iterable[GGUFWeight]:
             patch_embed_parts: dict[str, torch.Tensor] = {}
             quantized_bases: set[str] = set()
+            dense_types: dict[str, int] = {}
             for name, weight in weights:
                 # weight_type entries arrive before their packed weight data.
                 if name.endswith(".weight_type"):
-                    quantized_bases.add(name.removesuffix(".weight_type"))
+                    base = name.removesuffix(".weight_type")
+                    if base in self._DENSE_MODULES:
+                        dense_types[base] = int(weight)
+                        continue
+                    quantized_bases.add(base)
+                elif name.endswith(".weight") and name.removesuffix(".weight") in dense_types:
+                    qtype = gguf.GGMLQuantizationType(
+                        dense_types.pop(name.removesuffix(".weight"))
+                    )
+                    weight = torch.from_numpy(
+                        gguf.quants.dequantize(weight.cpu().numpy(), qtype)
+                    )
                 if layout is not None:
                     reordered = self._restore_gdn_weight(
                         name, weight, text_config, layout, quantized_bases
