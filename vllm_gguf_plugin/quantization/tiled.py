@@ -36,6 +36,9 @@ def can_tile(weight_type: int, weight: torch.Tensor) -> bool:
         and weight.dim() == 2
         and weight.dtype == torch.uint8
         and weight.shape[1] % nb == 0
+        # tiny matrices (e.g. the fused gated-delta-net gate projection in_proj_ba, 64 rows) gain nothing and
+        # made Ornith (Qwen3.5-MoE, MTP 3, CUDA graphs) produce degenerate answers in a few cases (cause not understood)
+        and weight.shape[0] >= 128
         and weight.is_cuda
         and tiled_available()
     )
