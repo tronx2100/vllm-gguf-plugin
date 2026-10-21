@@ -32,6 +32,33 @@ from .utils import (
 )
 
 
+# MMQ walks the row in steps of 32 // QI blocks and reads a whole step even when the row ends
+# earlier (past the row, and past the tensor for the last row: a NaN scale there turns the
+# output NaN). Use it only when the row length is a multiple of that step.
+_MMQ_QI = {
+    WeightType.Q4_0: 4,
+    WeightType.Q4_1: 4,
+    WeightType.Q5_0: 4,
+    WeightType.Q5_1: 4,
+    WeightType.Q8_0: 8,
+    WeightType.Q8_1: 8,
+    WeightType.Q2_K: 16,
+    WeightType.Q3_K: 16,
+    WeightType.Q4_K: 32,
+    WeightType.Q5_K: 32,
+    WeightType.Q6_K: 32,
+}
+
+
+def _mmq_row_aligned(weight: torch.Tensor, weight_type: int) -> bool:
+    qi = _MMQ_QI.get(WeightType(weight_type))
+    if qi is None:
+        return False
+    block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+    cols = weight.shape[1] // type_size * block_size
+    return cols % (block_size * (32 // qi)) == 0
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, weight: torch.Tensor, weight_type: int
 ) -> torch.Tensor:
@@ -46,7 +73,7 @@ def _fused_mul_mat_gguf(
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
-    elif weight_type in MMQ_QUANT_TYPES:
+    elif weight_type in MMQ_QUANT_TYPES and _mmq_row_aligned(weight, weight_type):
         y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
