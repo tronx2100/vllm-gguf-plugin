@@ -11,8 +11,11 @@ import gguf
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+try:
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+    from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeConfig
+except ImportError:  # newer vLLM no longer ships these configs; Transformers has them
+    from transformers import Qwen3_5Config, Qwen3_5MoeConfig
 
 from ..gguf_files import GGUFModelFiles
 from ..gguf_utils import maybe_patch_hf_config_from_gguf
