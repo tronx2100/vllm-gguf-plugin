@@ -81,6 +81,9 @@ def _fused_moe_dequantized(x, w1, w2, topk_weights, topk_ids, weight_type, weigh
     return out
 
 
+_MAX_GRID_Z = 65535   # CUDA limit for gridDim.z
+
+
 def _fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -157,16 +160,24 @@ def _fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ops.ggml_moe_a8_vec(x, w1, topk_ids, top_k, weight_type, N, num_tokens)
-        out = act(out)
+        # The kernel runs one CUDA grid slice per (token, expert) pair along gridDim.z, which is limited
+        # to 65535: split big batches (e.g. a profiling run with 8192 tokens x 8 experts).
+        step = max(1, _MAX_GRID_Z // top_k)
+        for s in range(0, num_tokens, step):
+            e = min(s + step, num_tokens)
+            n = e - s
+            out = ops.ggml_moe_a8_vec(
+                x[s:e], w1, topk_ids[s:e], top_k, weight_type, N, n
+            )
+            out = act(out)
 
-        out = ops.ggml_moe_a8_vec(
-            out, w2, topk_ids, 1, weight_type2, w2.shape[1], num_tokens * top_k
-        )
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
-        )
-        ops.moe_sum(out, out_hidden_states)
+            out = ops.ggml_moe_a8_vec(
+                out, w2, topk_ids[s:e], 1, weight_type2, w2.shape[1], n * top_k
+            )
+            out = out.reshape(n, top_k, w2.shape[1]).mul_(
+                topk_weights[s:e].view(n, top_k, 1)
+            )
+            ops.moe_sum(out, out_hidden_states[s:e])
     else:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
