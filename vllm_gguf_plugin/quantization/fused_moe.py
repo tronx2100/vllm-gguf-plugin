@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from functools import partial
+
+import gguf
 
 import torch
 from vllm.model_executor.layers.fused_moe import (
@@ -28,7 +31,27 @@ from .params import (
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
 )
-from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+from .utils import DEQUANT_TYPES, MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+
+# From this many tokens on the experts of a layer are dequantized to dense weights and run through vLLM's tensor-core grouped GEMM
+# (Triton fused_experts): a big batch touches nearly every expert anyway, and the int8 dp4a kernel behind ggml_moe_a8 is several times slower.
+MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("GGUF_MOE_DEQUANT_MIN_TOKENS", "1024"))
+
+
+def _dequantize_experts(w: torch.Tensor, weight_type: int, dtype: torch.dtype) -> torch.Tensor:
+    """[E, rows, bytes] quantized expert weights -> dense [E, rows, cols]."""
+    E, rows, nbytes = w.shape
+    block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+    cols = nbytes // type_size * block_size
+    return ops.ggml_dequantize(w.reshape(E * rows, nbytes), weight_type, E * rows, cols, dtype).view(E, rows, cols)
+
+
+def _fused_moe_dequantized(x, w1, w2, topk_weights, topk_ids, weight_type, weight_type2, activation_enum):
+    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+
+    w1d = _dequantize_experts(w1, weight_type, x.dtype)
+    w2d = _dequantize_experts(w2, weight_type2, x.dtype)
+    return fused_experts(x, w1d, w2d, topk_weights, topk_ids, activation=activation_enum)
 
 
 def _fused_moe_gguf(
@@ -51,6 +74,15 @@ def _fused_moe_gguf(
         return out
 
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
+
+    if (
+        x.shape[0] >= MOE_DEQUANT_MIN_TOKENS
+        and weight_type in DEQUANT_TYPES
+        and weight_type2 in DEQUANT_TYPES
+    ):
+        return _fused_moe_dequantized(
+            x, w1, w2, topk_weights, topk_ids, weight_type, weight_type2, activation_enum
+        )
 
     out_hidden_states = torch.empty_like(x)
     if (
