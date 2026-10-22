@@ -325,6 +325,15 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         from . import fused_moe_gguf as fused_moe_gguf_op
 
+        expert_map = layer.expert_map
+        if expert_map is not None:
+            # Expert parallelism: this rank only holds a slice of the experts. Map the global ids to local ones and give
+            # the experts of other ranks weight 0 (their output is added up by the all-reduce after the layer).
+            local_ids = expert_map[topk_ids.long()]
+            local = local_ids >= 0
+            topk_weights = topk_weights * local
+            topk_ids = torch.where(local, local_ids, torch.zeros_like(local_ids)).to(topk_ids.dtype)
+
         return fused_moe_gguf_op(
             x,
             layer.w13_weight,
