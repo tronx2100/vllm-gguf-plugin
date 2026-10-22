@@ -116,9 +116,10 @@ tests, so treat them as manually verified rather than guaranteed.
 
 Decode and prefill use tensor-core kernels on a tiled weight layout for Q3_K,
 Q4_K, Q5_K, Q6_K, Q8_0, IQ3_XXS, IQ4_NL, IQ4_XS and NVFP4 (batches of up to 64
-tokens; larger batches dequantize and use a dense GEMM). Expert weights of
-MoE models are dequantized per layer and run through vLLM's grouped GEMM once a
-step has at least 768 tokens (`GGUF_MOE_DEQUANT_MIN_TOKENS`). Set
+tokens; larger batches dequantize and use a dense GEMM). Optionally (`GGUF_MOE_DEQUANT_MIN_TOKENS`, off by default) the expert weights of MoE
+models are dequantized per layer and run through vLLM's grouped GEMM for large
+batches: prefill up to ~1.8x faster, at the price of ~0.2 GiB per GPU of KV cache
+(`GGUF_MOE_DEQUANT_CHUNK_MB` sets the group size). Set
 `GGUF_NO_TILED=1` to fall back to the row-major kernels.
 
 Other vLLM-supported architectures may work when their GGUF tensor names map

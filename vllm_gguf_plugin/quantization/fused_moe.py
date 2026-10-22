@@ -33,9 +33,13 @@ from .params import (
 )
 from .utils import DEQUANT_TYPES, MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 
-# From this many tokens on the experts of a layer are dequantized to dense weights and run through vLLM's tensor-core grouped GEMM
-# (Triton fused_experts): a big batch touches nearly every expert anyway, and the int8 dp4a kernel behind ggml_moe_a8 is several times slower.
-MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("GGUF_MOE_DEQUANT_MIN_TOKENS", "768"))
+# Optional (off by default): from this many tokens on, the experts of a layer are dequantized to dense weights and run through
+# vLLM's tensor-core grouped GEMM (Triton fused_experts); a big batch touches nearly every expert anyway and the int8 dp4a kernel
+# behind ggml_moe_a8 is several times slower. It makes the prefill of MoE models up to ~1.8x faster, but the temporary dense
+# weights raise the peak memory of a step (~0.2 GiB per GPU with the default group size, more with bigger groups), which the
+# memory profile takes away from the KV cache - so it is only enabled by setting GGUF_MOE_DEQUANT_MIN_TOKENS (e.g. 1024).
+MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("GGUF_MOE_DEQUANT_MIN_TOKENS", 10**12))
+MOE_DEQUANT_CHUNK_BYTES = int(float(os.environ.get("GGUF_MOE_DEQUANT_CHUNK_MB", "64")) * 2**20)
 
 
 def _dequantize_experts(w: torch.Tensor, weight_type: int, dtype: torch.dtype) -> torch.Tensor:
@@ -49,9 +53,32 @@ def _dequantize_experts(w: torch.Tensor, weight_type: int, dtype: torch.dtype) -
 def _fused_moe_dequantized(x, w1, w2, topk_weights, topk_ids, weight_type, weight_type2, activation_enum):
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 
-    w1d = _dequantize_experts(w1, weight_type, x.dtype)
-    w2d = _dequantize_experts(w2, weight_type2, x.dtype)
-    return fused_experts(x, w1d, w2d, topk_weights, topk_ids, activation=activation_enum)
+    # The dequantized experts of a whole layer need ~1 GB per GPU on top of the model, which the memory profile
+    # counts against the KV cache. Dequantize them in groups of at most MOE_DEQUANT_CHUNK_BYTES and run the grouped
+    # GEMM per group (expert_map hides the experts of the other groups; their rows are zeroed by vLLM).
+    E, rows1, nbytes1 = w1.shape
+    _, rows2, nbytes2 = w2.shape
+    bs1, ts1 = gguf.GGML_QUANT_SIZES[weight_type]
+    bs2, ts2 = gguf.GGML_QUANT_SIZES[weight_type2]
+    per_expert = (rows1 * (nbytes1 // ts1 * bs1) + rows2 * (nbytes2 // ts2 * bs2)) * x.element_size()
+    group = max(1, min(E, MOE_DEQUANT_CHUNK_BYTES // per_expert))
+    if group >= E:
+        w1d = _dequantize_experts(w1, weight_type, x.dtype)
+        w2d = _dequantize_experts(w2, weight_type2, x.dtype)
+        return fused_experts(x, w1d, w2d, topk_weights, topk_ids, activation=activation_enum)
+    out = None
+    for a in range(0, E, group):
+        b = min(E, a + group)
+        w1d = _dequantize_experts(w1[a:b], weight_type, x.dtype)
+        w2d = _dequantize_experts(w2[a:b], weight_type2, x.dtype)
+        expert_map = torch.full((E,), -1, dtype=torch.int32, device=x.device)
+        expert_map[a:b] = torch.arange(b - a, dtype=torch.int32, device=x.device)
+        y = fused_experts(
+            x, w1d, w2d, topk_weights, topk_ids, activation=activation_enum,
+            global_num_experts=E, expert_map=expert_map,
+        )
+        out = y if out is None else out.add_(y)
+    return out
 
 
 def _fused_moe_gguf(
