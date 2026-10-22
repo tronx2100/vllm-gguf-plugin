@@ -765,6 +765,22 @@ static __global__ void dequantize_q5k_tiled(const uint8_t * __restrict__ wt, con
 }
 
 
+// IQ4_NL / IQ4_XS value table (kvalues_iq4nl) for 8 nibbles at once without memory accesses: the low three bits of
+// each nibble pick a byte of one of two 8-entry tables with prmt, bit 3 selects the table.
+// Returns the int8x4 of the four low nibbles (x) and of the four high nibbles (y) of the four bytes in q4.
+__device__ __forceinline__ int2 iq4nl_values(const uint32_t q4) {
+    const uint32_t qm = q4 & 0x77777777u;
+    const uint32_t a0 = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, qm);          // entries 0..7 for nibbles 0..3
+    const uint32_t a1 = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, qm >> 16);    // ... nibbles 4..7
+    const uint32_t b0 = __byte_perm(0x26190D01u, 0x71594535u, qm);          // entries 8..15
+    const uint32_t b1 = __byte_perm(0x26190D01u, 0x71594535u, qm >> 16);
+    const uint32_t m_lo = ((q4 >> 3) & 0x01010101u) * 0xFFu;
+    const uint32_t m_hi = ((q4 >> 7) & 0x01010101u) * 0xFFu;
+    const uint32_t v_lo = (__byte_perm(a0, a1, 0x6420) & ~m_lo) | (__byte_perm(b0, b1, 0x6420) & m_lo);
+    const uint32_t v_hi = (__byte_perm(a0, a1, 0x7531) & ~m_hi) | (__byte_perm(b0, b1, 0x7531) & m_hi);
+    return make_int2((int) v_lo, (int) v_hi);
+}
+
 // ---------------------------------------------------------------------------------------------
 // IQ4_XS: tiled row-block = qs[128] | sc int8[8] | pad[8] = 144 bytes; d plane: 16 x half
 #define I4T_ROWB 144
@@ -852,8 +868,9 @@ static __global__ void mul_mat_iq4xs_tiled(const uint8_t * __restrict__ wt, cons
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             int a0, a1, a2, a3;
-            get_int_from_table_16(qsA[4*j + t], values, a0, a2);   // low nibbles -> k 4t.., high nibbles -> k 16+4t..
-            get_int_from_table_16(qsB[4*j + t], values, a1, a3);
+            const int2 la = iq4nl_values(qsA[4*j + t]);   // low nibbles -> k 4t.., high nibbles -> k 16+4t..
+            const int2 lb = iq4nl_values(qsB[4*j + t]);
+            a0 = la.x; a2 = la.y; a1 = lb.x; a3 = lb.y;
             const int * q8 = (const int *) yB[i*8 + j].qs;
             int c[4] = {0, 0, 0, 0};
             mma_s8_16x8x32_t(c, a0, a1, a2, a3, q8[t], q8[4 + t]);
@@ -1378,6 +1395,151 @@ static __global__ void dequantize_nvfp4_tiled(const uint8_t * __restrict__ wt, c
             const int nib = hl ? (byte >> 4) : (byte & 15);
             const uint32_t sc = *(const uint32_t *) (sm + NVT_TILE_BYTES + b*64 + r*4);
             out[(size_t) row * cols + i * 256 + c] = (scalar_t) (nvfp4_scale(sc, s) * (float) nvfp4_kvalues[nib]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// IQ4_NL (GGML type 20): block of 32 weights = d (half) | qs[16] (byte j: weight j low nibble, weight 16+j high nibble).
+// Tiled layout of a 256-weight group (8 blocks) of 16 rows: qs plane [block b][row r][16 bytes], d plane [b][r] halves.
+#define NLT_TILE_BYTES 2048
+#define NLT_D_BYTES 256
+#define NLT_STAGE_BYTES (NLT_TILE_BYTES + NLT_D_BYTES)
+#define NLT_WARPS 4
+#define NLT_STAGES 5
+
+template <typename scalar_t>
+static __global__ void mul_mat_iq4nl_tiled(const uint8_t * __restrict__ wt, const uint8_t * __restrict__ wd, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows, const int nvecs) {
+    const int lane = threadIdx.x;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int wk = threadIdx.y;
+    const int row0 = blockIdx.x * 16;
+    const int vec0 = blockIdx.y * 8;
+    const int nv = min(8, nvecs - vec0);
+    const int bpr = ncols / 256;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    const int nsb = (bpr - wk + NLT_WARPS - 1) / NLT_WARPS;
+
+    __shared__ __align__(16) uint8_t smem[NLT_WARPS][NLT_STAGES][NLT_STAGE_BYTES];
+    const uint8_t * tile_base = wt + (size_t) blockIdx.x * bpr * NLT_TILE_BYTES;
+    const uint8_t * d_base = wd + (size_t) blockIdx.x * bpr * NLT_D_BYTES;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int tokB = vec0 + min(g, nv - 1);
+    const int n0 = min(2*t, nv - 1), n1 = min(2*t + 1, nv - 1);
+    const block_q8_1 * yB = y + (size_t) tokB*(nrows_y/QK8_1);
+    const block_q8_1 * y0 = y + (size_t) (vec0 + n0)*(nrows_y/QK8_1);
+    const block_q8_1 * y1 = y + (size_t) (vec0 + n1)*(nrows_y/QK8_1);
+
+    auto issue = [&](int n) {
+        const int i = wk + n*NLT_WARPS;
+        const uint8_t * src = tile_base + (size_t) i * NLT_TILE_BYTES;
+        uint8_t * dstp = smem[wk][n % NLT_STAGES];
+#pragma unroll
+        for (int c = lane; c < NLT_TILE_BYTES/16; c += 32) {
+            cp_async16(dstp + c*16, src + c*16);
+        }
+        if (lane < NLT_D_BYTES/16) {
+            cp_async16(dstp + NLT_TILE_BYTES + lane*16, d_base + (size_t) i * NLT_D_BYTES + lane*16);
+        }
+    };
+
+#pragma unroll
+    for (int s = 0; s < NLT_STAGES - 1; ++s) {
+        if (s < nsb) {
+            issue(s);
+        }
+        cp_async_commit();
+    }
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+    for (int n = 0; n < nsb; ++n) {
+        cp_async_wait<NLT_STAGES - 2>();
+        __syncwarp();
+        if (n + NLT_STAGES - 1 < nsb) {
+            issue(n + NLT_STAGES - 1);
+        }
+        cp_async_commit();
+
+        const int i = wk + n*NLT_WARPS;
+        const uint8_t * stage = smem[wk][n % NLT_STAGES];
+        const half * dh = (const half *) (stage + NLT_TILE_BYTES);
+
+#pragma unroll
+        for (int b = 0; b < 8; ++b) {
+            const int2 la = iq4nl_values(*(const uint32_t *) (stage + b*256 + g*16 + t*4));
+            const int2 lb = iq4nl_values(*(const uint32_t *) (stage + b*256 + (g + 8)*16 + t*4));
+            const int * q8 = (const int *) yB[i*8 + b].qs;
+            int c[4] = {0, 0, 0, 0};
+            mma_s8_16x8x32_t(c, la.x, lb.x, la.y, lb.y, q8[t], q8[4 + t]);
+            const float dA = __half2float(dh[b*16 + g]);
+            const float dB = __half2float(dh[b*16 + g + 8]);
+            const float dy0 = __low2float(y0[i*8 + b].ds);
+            const float dy1 = __low2float(y1[i*8 + b].ds);
+            acc[0] += (float) c[0] * dA * dy0;
+            acc[1] += (float) c[1] * dA * dy1;
+            acc[2] += (float) c[2] * dB * dy0;
+            acc[3] += (float) c[3] * dB * dy1;
+        }
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+
+    float (*red)[32][4] = (float (*)[32][4]) &smem[0][0][0];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        red[wk][lane][k] = acc[k];
+    }
+    __syncthreads();
+    if (wk != 0) {
+        return;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+        for (int w = 1; w < NLT_WARPS; ++w) {
+            acc[k] += red[w][lane][k];
+        }
+    }
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int tok = 2*t + u;
+        if (tok < nv) {
+            if (r0 < nrows) dst[(size_t)(vec0 + tok)*nrows + r0] = acc[u];
+            if (r1 < nrows) dst[(size_t)(vec0 + tok)*nrows + r1] = acc[2 + u];
+        }
+    }
+}
+
+template <typename scalar_t>
+static __global__ void dequantize_iq4nl_tiled(const uint8_t * __restrict__ wt, const uint8_t * __restrict__ wd, scalar_t * __restrict__ out, const int cols, const int rows) {
+    __shared__ __align__(16) uint8_t sm[NLT_STAGE_BYTES];
+    const int tile = blockIdx.x;
+    const int i = blockIdx.y;
+    const int bpr = cols / 256;
+    const uint4 * src = (const uint4 *) (wt + ((size_t) tile * bpr + i) * NLT_TILE_BYTES);
+    const uint4 * dsrc = (const uint4 *) (wd + ((size_t) tile * bpr + i) * NLT_D_BYTES);
+    uint4 * dst = (uint4 *) sm;
+    for (int o = threadIdx.x; o < NLT_TILE_BYTES / 16; o += blockDim.x) {
+        dst[o] = src[o];
+    }
+    if (threadIdx.x < NLT_D_BYTES / 16) {
+        dst[NLT_TILE_BYTES / 16 + threadIdx.x] = dsrc[threadIdx.x];
+    }
+    __syncthreads();
+    const int c = threadIdx.x;                 // 0..255 within the group
+    const int b = c >> 5, k = c & 31;
+    const int8_t * vals = (const int8_t *) kvalues_iq4nl;
+#pragma unroll 4
+    for (int r = 0; r < 16; ++r) {
+        const int row = tile * 16 + r;
+        if (row < rows) {
+            const int byte = sm[b*256 + r*16 + (k & 15)];
+            const int nib = (k < 16) ? (byte & 15) : (byte >> 4);
+            const float d = __half2float(((const half *) (sm + NLT_TILE_BYTES))[b*16 + r]);
+            out[(size_t) row * cols + i * 256 + c] = (scalar_t) (d * vals[nib]);
         }
     }
 }
