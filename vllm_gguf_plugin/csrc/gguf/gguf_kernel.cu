@@ -220,7 +220,7 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
 }
 
 
-// ---- tiled weight layouts (see mmvq_tiled.cuh): Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ3_XXS (18), IQ4_NL (20), IQ4_XS (23), NVFP4 (40) ----
+// ---- tiled weight layouts (see mmvq_tiled.cuh): Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ3_XXS (18), Q8_0 (8, 128-weight groups), IQ4_NL (20), IQ4_XS (23), NVFP4 (40) ----
 template <typename scalar_t>
 static void tiled_mul_launch(int type, const void * wt, const void * wd, const void * vy, scalar_t * dst, const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
   const dim3 block_nums((nrows + 15) / 16, (nvecs + 7) / 8, 1);
@@ -238,6 +238,8 @@ static void tiled_mul_launch(int type, const void * wt, const void * wd, const v
     mul_mat_iq4xs_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, I4T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
   } else if (type == 14) {
     mul_mat_q6k_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q6T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
+  } else if (type == 8) {
+    mul_mat_q8_0_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, Q8T_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
   } else if (type == 20) {
     mul_mat_iq4nl_tiled<scalar_t><<<block_nums, dim3(WARP_SIZE, NLT_WARPS, 1), 0, stream>>>(w, d, vy, dst, ncols, nrows, nvecs);
   } else if (type == 40) {
@@ -284,6 +286,8 @@ static void tiled_dequant_launch(int type, const void * wt, const void * wd, sca
     dequantize_tiled_fast<scalar_t, DqIQ3XXS><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 23) {
     dequantize_iq4xs_tiled<scalar_t><<<block_nums, 128, 0, stream>>>(w, d, out, cols, rows);
+  } else if (type == 8) {
+    dequantize_q8_0_tiled<scalar_t><<<dim3(block_nums.x, cols / 128, 1), 128, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 20) {
     dequantize_iq4nl_tiled<scalar_t><<<block_nums, 256, 0, stream>>>(w, d, out, cols, rows);
   } else if (type == 40) {

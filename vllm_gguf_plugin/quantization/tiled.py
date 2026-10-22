@@ -18,6 +18,7 @@ _BLOCK_BYTES = {
     int(WeightType.Q5_K): 176,
     int(WeightType.Q6_K): 210,
     int(WeightType.IQ3_XXS): 98,
+    int(WeightType.Q8_0): 136,      # 4 Q8_0 blocks of 32 weights (34 bytes) = one 128-weight group (the others use 256)
     int(WeightType.IQ4_NL): 144,    # 8 IQ4_NL blocks of 32 weights (18 bytes) = one 256-weight group
     int(WeightType.NVFP4): 144,     # 4 NVFP4 blocks of 64 weights (36 bytes) = one 256-weight group
     int(WeightType.IQ4_XS): 136,
@@ -105,6 +106,12 @@ def repack(weight_type: int, weight: torch.Tensor):
         pad = torch.zeros(*sc8.shape[:-1], 8, dtype=torch.uint8, device=x.device)
         main = torch.cat([x[..., 8:136], sc8, pad], dim=-1)
         d = x[..., 0:2]
+    elif t == int(WeightType.Q8_0):
+        # 4 blocks of d[2] qs[32] per group -> qs plane [b][r][t][half][4 bytes] (weights 4t.. | 16+4t.. as mma fragments) | d plane [b][r]
+        blk = x.view(*x.shape[:-1], 4, 34)
+        d = blk[..., :2].permute(0, 1, 3, 2, 4)
+        q = blk[..., 2:].reshape(*x.shape[:-1], 4, 2, 4, 4)   # [T, B, r, b, half, t, j]
+        main = q.permute(0, 1, 3, 2, 5, 4, 6)                  # [T, B, b, r, t, half, j]
     elif t == int(WeightType.IQ4_NL):
         # 8 blocks of d[2] qs[16] per group -> qs plane [b][r][16] | d plane [b][r]
         blk = x.view(*x.shape[:-1], 8, 18)
@@ -123,4 +130,4 @@ def repack(weight_type: int, weight: torch.Tensor):
         main = v.permute(0, 1, 3, 2, 5, 4, 6)               # [T, B, b, r, t, sp, j]
     else:
         raise ValueError(f"unsupported type {t}")
-    return main.contiguous().view(-1), d.contiguous().view(-1), rows, bpr * 256
+    return main.contiguous().view(-1), d.contiguous().view(-1), rows, bpr * (128 if t == int(WeightType.Q8_0) else 256)

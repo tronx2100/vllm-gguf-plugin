@@ -1543,3 +1543,149 @@ static __global__ void dequantize_iq4nl_tiled(const uint8_t * __restrict__ wt, c
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Q8_0 (GGML type 8): block of 32 weights = d (half) | qs[32] (int8). The tiled group is 128 weights (4 blocks), not 256,
+// to keep the pipeline stages within the 48 KB of static shared memory.
+// qs plane per group and 16 rows: [block b][row r][thread t][word: weights 4t.. | weights 16+4t..][4 bytes]; d plane: [b][r] halves.
+#define Q8T_GROUP 128
+#define Q8T_TILE_BYTES 2048
+#define Q8T_D_BYTES 128
+#define Q8T_STAGE_BYTES (Q8T_TILE_BYTES + Q8T_D_BYTES)
+#define Q8T_WARPS 4
+#define Q8T_STAGES 5
+
+template <typename scalar_t>
+static __global__ void mul_mat_q8_0_tiled(const uint8_t * __restrict__ wt, const uint8_t * __restrict__ wd, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows, const int nvecs) {
+    const int lane = threadIdx.x;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int wk = threadIdx.y;
+    const int row0 = blockIdx.x * 16;
+    const int vec0 = blockIdx.y * 8;
+    const int nv = min(8, nvecs - vec0);
+    const int bpr = ncols / Q8T_GROUP;
+    const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+    const int nsb = (bpr - wk + Q8T_WARPS - 1) / Q8T_WARPS;
+
+    __shared__ __align__(16) uint8_t smem[Q8T_WARPS][Q8T_STAGES][Q8T_STAGE_BYTES];
+    const uint8_t * tile_base = wt + (size_t) blockIdx.x * bpr * Q8T_TILE_BYTES;
+    const uint8_t * d_base = wd + (size_t) blockIdx.x * bpr * Q8T_D_BYTES;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int tokB = vec0 + min(g, nv - 1);
+    const int n0 = min(2*t, nv - 1), n1 = min(2*t + 1, nv - 1);
+    const block_q8_1 * yB = y + (size_t) tokB*(nrows_y/QK8_1);
+    const block_q8_1 * y0 = y + (size_t) (vec0 + n0)*(nrows_y/QK8_1);
+    const block_q8_1 * y1 = y + (size_t) (vec0 + n1)*(nrows_y/QK8_1);
+
+    auto issue = [&](int n) {
+        const int i = wk + n*Q8T_WARPS;
+        const uint8_t * src = tile_base + (size_t) i * Q8T_TILE_BYTES;
+        uint8_t * dstp = smem[wk][n % Q8T_STAGES];
+#pragma unroll
+        for (int c = lane; c < Q8T_TILE_BYTES/16; c += 32) {
+            cp_async16(dstp + c*16, src + c*16);
+        }
+        if (lane < Q8T_D_BYTES/16) {
+            cp_async16(dstp + Q8T_TILE_BYTES + lane*16, d_base + (size_t) i * Q8T_D_BYTES + lane*16);
+        }
+    };
+
+#pragma unroll
+    for (int s = 0; s < Q8T_STAGES - 1; ++s) {
+        if (s < nsb) {
+            issue(s);
+        }
+        cp_async_commit();
+    }
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+    for (int n = 0; n < nsb; ++n) {
+        cp_async_wait<Q8T_STAGES - 2>();
+        __syncwarp();
+        if (n + Q8T_STAGES - 1 < nsb) {
+            issue(n + Q8T_STAGES - 1);
+        }
+        cp_async_commit();
+
+        const int i = wk + n*Q8T_WARPS;
+        const uint8_t * stage = smem[wk][n % Q8T_STAGES];
+        const half * dh = (const half *) (stage + Q8T_TILE_BYTES);
+
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const uint2 qa = *(const uint2 *) (stage + b*512 + g*32 + t*8);
+            const uint2 qb = *(const uint2 *) (stage + b*512 + (g + 8)*32 + t*8);
+            const int * q8 = (const int *) yB[i*4 + b].qs;
+            int c[4] = {0, 0, 0, 0};
+            mma_s8_16x8x32_t(c, (int) qa.x, (int) qb.x, (int) qa.y, (int) qb.y, q8[t], q8[4 + t]);
+            const float dA = __half2float(dh[b*16 + g]);
+            const float dB = __half2float(dh[b*16 + g + 8]);
+            const float dy0 = __low2float(y0[i*4 + b].ds);
+            const float dy1 = __low2float(y1[i*4 + b].ds);
+            acc[0] += (float) c[0] * dA * dy0;
+            acc[1] += (float) c[1] * dA * dy1;
+            acc[2] += (float) c[2] * dB * dy0;
+            acc[3] += (float) c[3] * dB * dy1;
+        }
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+
+    float (*red)[32][4] = (float (*)[32][4]) &smem[0][0][0];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        red[wk][lane][k] = acc[k];
+    }
+    __syncthreads();
+    if (wk != 0) {
+        return;
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+#pragma unroll
+        for (int w = 1; w < Q8T_WARPS; ++w) {
+            acc[k] += red[w][lane][k];
+        }
+    }
+    const int r0 = row0 + g, r1 = row0 + g + 8;
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+        const int tok = 2*t + u;
+        if (tok < nv) {
+            if (r0 < nrows) dst[(size_t)(vec0 + tok)*nrows + r0] = acc[u];
+            if (r1 < nrows) dst[(size_t)(vec0 + tok)*nrows + r1] = acc[2 + u];
+        }
+    }
+}
+
+template <typename scalar_t>
+static __global__ void dequantize_q8_0_tiled(const uint8_t * __restrict__ wt, const uint8_t * __restrict__ wd, scalar_t * __restrict__ out, const int cols, const int rows) {
+    __shared__ __align__(16) uint8_t sm[Q8T_STAGE_BYTES];
+    const int tile = blockIdx.x;
+    const int i = blockIdx.y;
+    const int bpr = cols / Q8T_GROUP;
+    const uint4 * src = (const uint4 *) (wt + ((size_t) tile * bpr + i) * Q8T_TILE_BYTES);
+    const uint4 * dsrc = (const uint4 *) (wd + ((size_t) tile * bpr + i) * Q8T_D_BYTES);
+    uint4 * dst = (uint4 *) sm;
+    for (int o = threadIdx.x; o < Q8T_TILE_BYTES / 16; o += blockDim.x) {
+        dst[o] = src[o];
+    }
+    if (threadIdx.x < Q8T_D_BYTES / 16) {
+        dst[Q8T_TILE_BYTES / 16 + threadIdx.x] = dsrc[threadIdx.x];
+    }
+    __syncthreads();
+    const int c = threadIdx.x;                 // 0..127 within the group
+    const int b = c >> 5, k = c & 31;
+    const int hf = k >> 4, t = (k & 15) >> 2, j = k & 3;
+#pragma unroll 4
+    for (int r = 0; r < 16; ++r) {
+        const int row = tile * 16 + r;
+        if (row < rows) {
+            const int q = ((const int8_t *) sm)[b*512 + r*32 + t*8 + hf*4 + j];
+            const float d = __half2float(((const half *) (sm + Q8T_TILE_BYTES))[b*16 + r]);
+            out[(size_t) row * cols + i * Q8T_GROUP + c] = (scalar_t) (d * (float) q);
+        }
+    }
+}
