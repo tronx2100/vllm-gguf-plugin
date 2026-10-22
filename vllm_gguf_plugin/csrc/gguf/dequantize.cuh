@@ -455,6 +455,139 @@ static void dequantize_row_nvfp4_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_nvfp4<<<k / 64, 64, 0, stream>>>(vx, y);
 }
 
+
+// ---- vectorised row-major dequantization of the K-quants / IQ4_XS ----
+// Every thread turns 8 consecutive weights into one 16-byte store (the scalar kernels above write 2-byte values with
+// poor coalescing and reach only ~55 % of the memory bandwidth) and computes in float. Used for the large batches of
+// the MoE experts, which are dequantized per layer.
+template<typename dst_t>
+static __device__ __forceinline__ void store8(dst_t * p, const float * v) {
+    alignas(16) dst_t t[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        t[k] = (dst_t) v[k];
+    }
+    const uint4 * src = (const uint4 *) t;
+    uint4 * dst = (uint4 *) p;
+    dst[0] = src[0];
+    if (sizeof(dst_t) == 4) {
+        dst[1] = src[1];
+    }
+}
+
+// 16 threads per superblock (group il of 64 weights, chunk c of 8 bytes), 8 superblocks per block of 128 threads
+template<typename dst_t>
+static __global__ void dequantize_q4_K_vec(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 4);
+    if (i >= nsb) {
+        return;
+    }
+    const int t = threadIdx.x & 15, il = t >> 2, c = t & 3;
+    const block_q4_K * x = (const block_q4_K *) vx + i;
+    const float dall = __half2float(__low2half(x->dm)), dmin = __half2float(__high2half(x->dm));
+    uint8_t sc, m;
+    get_scale_min_k4(2*il, x->scales, sc, m);
+    const float d1 = dall * sc, m1 = dmin * m;
+    get_scale_min_k4(2*il + 1, x->scales, sc, m);
+    const float d2 = dall * sc, m2 = dmin * m;
+    const uint2 q = *(const uint2 *) (x->qs + 32*il + 8*c);
+    const uint8_t * qb = (const uint8_t *) &q;
+    float lo[8], hi[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        lo[k] = d1 * (qb[k] & 0xF) - m1;
+        hi[k] = d2 * (qb[k] >> 4) - m2;
+    }
+    dst_t * y = yy + i*QK_K + 64*il + 8*c;
+    store8(y, lo);
+    store8(y + 32, hi);
+}
+
+template<typename dst_t>
+static __global__ void dequantize_q5_K_vec(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 4);
+    if (i >= nsb) {
+        return;
+    }
+    const int t = threadIdx.x & 15, il = t >> 2, c = t & 3;
+    const block_q5_K * x = (const block_q5_K *) vx + i;
+    const float dall = __half2float(__low2half(x->dm)), dmin = __half2float(__high2half(x->dm));
+    uint8_t sc, m;
+    get_scale_min_k4(2*il, x->scales, sc, m);
+    const float d1 = dall * sc, m1 = dmin * m;
+    get_scale_min_k4(2*il + 1, x->scales, sc, m);
+    const float d2 = dall * sc, m2 = dmin * m;
+    const uint2 ql = *(const uint2 *) (x->qs + 32*il + 8*c);
+    const uint2 qh = *(const uint2 *) (x->qh + 8*c);
+    const uint8_t * qlb = (const uint8_t *) &ql;
+    const uint8_t * qhb = (const uint8_t *) &qh;
+    const uint8_t hm0 = 1 << (2*il), hm1 = 2 << (2*il);
+    float lo[8], hi[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        lo[k] = d1 * ((qlb[k] & 0xF) + ((qhb[k] & hm0) ? 16 : 0)) - m1;
+        hi[k] = d2 * ((qlb[k] >> 4)  + ((qhb[k] & hm1) ? 16 : 0)) - m2;
+    }
+    dst_t * y = yy + i*QK_K + 64*il + 8*c;
+    store8(y, lo);
+    store8(y + 32, hi);
+}
+
+// 8 threads per superblock (half ip of 128 weights, chunk c of 8 positions), 16 superblocks per block of 128 threads.
+// The 210-byte block is only 2-byte aligned, so the inputs are read byte-wise.
+template<typename dst_t>
+static __global__ void dequantize_q6_K_vec(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * 16 + (threadIdx.x >> 3);
+    if (i >= nsb) {
+        return;
+    }
+    const int t = threadIdx.x & 7, ip = t >> 2, c = t & 3;
+    const block_q6_K * x = (const block_q6_K *) vx + i;
+    const float d = __half2float(x->d);
+    const uint8_t * qa = x->ql + 64*ip + 8*c;
+    const uint8_t * qb = qa + 32;
+    const uint8_t * qh = x->qh + 32*ip + 8*c;
+    const int8_t * sc = x->scales + 8*ip + (c >> 1);
+    const float s0 = d * sc[0], s1 = d * sc[2], s2 = d * sc[4], s3 = d * sc[6];
+    float v0[8], v1[8], v2[8], v3[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int a = qa[k], b = qb[k], h = qh[k];
+        v0[k] = s0 * (((a & 0xF) | (((h >> 0) & 3) << 4)) - 32);
+        v1[k] = s1 * (((b & 0xF) | (((h >> 2) & 3) << 4)) - 32);
+        v2[k] = s2 * (((a >>  4) | (((h >> 4) & 3) << 4)) - 32);
+        v3[k] = s3 * (((b >>  4) | (((h >> 6) & 3) << 4)) - 32);
+    }
+    dst_t * y = yy + i*QK_K + 128*ip + 8*c;
+    store8(y, v0);
+    store8(y + 32, v1);
+    store8(y + 64, v2);
+    store8(y + 96, v3);
+}
+
+// 16 threads per superblock (sub-block ib of 32 weights, half c of 16), 8 superblocks per block of 128 threads
+template<typename dst_t>
+static __global__ void dequantize_iq4_xs_vec(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nsb) {
+    const int64_t i = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 4);
+    if (i >= nsb) {
+        return;
+    }
+    const int t = threadIdx.x & 15, ib = t >> 1, c = t & 1;
+    const block_iq4_xs * x = (const block_iq4_xs *) vx + i;
+    const float d = __half2float(x->d) * ((((x->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x->scales_h >> 2*ib) & 3) << 4)) - 32);
+    const uint2 q = *(const uint2 *) (x->qs + 16*ib + 8*c);
+    const uint8_t * qb = (const uint8_t *) &q;
+    float lo[8], hi[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        lo[k] = d * kvalues_iq4nl[qb[k] & 0xf];
+        hi[k] = d * kvalues_iq4nl[qb[k] >> 4];
+    }
+    dst_t * y = yy + i*QK_K + 32*ib + 8*c;
+    store8(y, lo);
+    store8(y + 16, hi);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int64_t num_blocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
@@ -476,19 +609,19 @@ static void dequantize_row_q3_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
-    dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_q4_K_vec<<<(nb + 7) / 8, 128, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
-    dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+    dequantize_q5_K_vec<<<(nb + 7) / 8, 128, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
-    dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+    dequantize_q6_K_vec<<<(nb + 15) / 16, 128, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
@@ -542,7 +675,7 @@ static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_iq4_xs_vec<<<(nb + 7) / 8, 128, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>

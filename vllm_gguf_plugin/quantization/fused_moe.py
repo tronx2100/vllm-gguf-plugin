@@ -35,7 +35,7 @@ from .utils import DEQUANT_TYPES, MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 
 # From this many tokens on the experts of a layer are dequantized to dense weights and run through vLLM's tensor-core grouped GEMM
 # (Triton fused_experts): a big batch touches nearly every expert anyway, and the int8 dp4a kernel behind ggml_moe_a8 is several times slower.
-MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("GGUF_MOE_DEQUANT_MIN_TOKENS", "1024"))
+MOE_DEQUANT_MIN_TOKENS = int(os.environ.get("GGUF_MOE_DEQUANT_MIN_TOKENS", "768"))
 
 
 def _dequantize_experts(w: torch.Tensor, weight_type: int, dtype: torch.dtype) -> torch.Tensor:
