@@ -114,6 +114,16 @@ tests, so treat them as manually verified rather than guaranteed.
 | Vision-language, MoE | Ornith 1.5 35B-A3B (Qwen3.5-MoE) | IQ4_XS experts, Q8_0 dense, BF16 projector | generation, MTP, image reading |
 | Vision-language, MoE | Qwopus-KAT-Coder 35B-A3B (Qwen3.5-MoE) | Q4_K_M with F32 projector | generation, MTP (3 and 4 draft tokens), tool calls, image and invoice reading (9/9), needle retrieval up to 180k tokens, fp8 and nvfp4 KV cache |
 | Text, MoE | Cyber-Tiel-Coder 35B-A3B (Qwen3.5-MoE) | UD-Q4_K_M (Q4_K / Q5_K experts, Q8_0 dense) | generation, MTP, tool calls, 24k-token needle retrieval |
+| Text, MoE | Qwen3-30B-A3B-Instruct-2507 (Qwen3-MoE) | ByteShape Q4_K_S 3.61 bpw (mixed Q2_K/Q3_K/Q5_K/IQ4_XS/Q8_0 experts and attention) | generation (expert parallelism switched on automatically) |
+| Text, MoE | Qwen3-Coder-30B-A3B-Instruct (Qwen3-MoE) | Q5_K_M | generation, code (expert parallelism switched on automatically) |
+
+Qwen3-MoE models (`qwen3_moe`) use the OLMoE-style adapter. Their expert
+intermediate size is 768, which tensor parallelism 2 would split into 384 per
+rank, cutting a 256-element K-quant block in half. The loader detects this and
+switches on expert parallelism by itself (a warning is logged; passing
+`--enable-expert-parallel` yourself gives the same result). Layers whose gate
+and up experts use different quantization types are re-encoded as Q8_0 for that
+layer, because vLLM fuses both into one parameter.
 
 Decode and prefill use tensor-core kernels on a tiled weight layout for Q3_K,
 Q4_K, Q5_K, Q6_K, Q8_0, IQ3_XXS, IQ4_NL, IQ4_XS and NVFP4 (batches of up to 64

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import gguf
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
@@ -202,10 +203,41 @@ class GGUFModelLoader(BaseModelLoader):
         adapter, plan = self._prepare_adapter(model_config)
         model.load_weights(self._iter_weights(adapter, plan, model_config))
 
+    def _maybe_enable_expert_parallel(
+        self, vllm_config: VllmConfig, model_config: ModelConfig
+    ) -> None:
+        """Switch on expert parallelism when tensor parallelism would cut a quantization block.
+
+        With tensor parallelism the stacked experts' intermediate dimension is split over the ranks. The
+        down projection is quantized along that dimension, so each rank's share has to be a multiple of
+        the block size (256 for the K-quants and IQ types). If it is not, a block is cut in half and the
+        model computes NaN. Expert parallelism gives every rank whole experts and avoids the split."""
+        pc = vllm_config.parallel_config
+        tp = pc.tensor_parallel_size
+        if tp < 2 or pc.enable_expert_parallel or pc.pipeline_parallel_size > 1:
+            return
+        files = self._prepare_model_files(model_config)
+        for path in files.backbone:
+            for t in gguf.GGUFReader(path).tensors:
+                if "ffn_down_exps" not in t.name or t.tensor_type.name in ("F32", "F16", "BF16"):
+                    continue
+                block_size = gguf.GGML_QUANT_SIZES[t.tensor_type][0]
+                inter = int(t.shape[0])   # input dimension of the down projection = expert intermediate size
+                if inter % tp or (inter // tp) % block_size:
+                    logger.warning(
+                        "Expert intermediate size %d split over %d tensor-parallel ranks (%g each) is not a multiple of the "
+                        "%s block size %d; enabling expert parallelism for this model (pass --enable-expert-parallel to "
+                        "silence this).",
+                        inter, tp, inter / tp, t.tensor_type.name, block_size,
+                    )
+                    pc.enable_expert_parallel = True
+                    return
+
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
         device_config = vllm_config.device_config
+        self._maybe_enable_expert_parallel(vllm_config, model_config)
         adapter, plan = self._prepare_adapter(model_config)
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
