@@ -108,10 +108,11 @@ tests, so treat them as manually verified rather than guaranteed.
 | Vision-language | Qwen 3.8 27B (dense, Qwen3.5 architecture) | Q4_K_M with Q8_0 projector | generation, MTP, tool calls, image reading |
 | Vision-language | Qwen 3.8 27B | IQ3_XXS / IQ4_XS / IQ3_S mix | generation, MTP, tool calls |
 | Vision-language | Qwen 3.8 27B | IQ4_NL / IQ3_S mix with Q8_0 projector | generation, MTP, tool calls, image reading |
-| Vision-language | Qwen 3.8 27B | NVFP4 with F16 projector | generation, MTP, image reading |
+| Vision-language | Qwen 3.8 27B | NVFP4 with F16 projector | generation, MTP, tool calls, image and invoice reading (9/9), needle retrieval up to 180k tokens |
 | Vision-language | Qwen 3.6 27B | Q5_K_M with F32 projector | generation, MTP, image reading |
 | Vision-language | Ornith 1.0 9B | Q8_0 with F16 projector | generation, MTP, tool calls, image reading |
 | Vision-language, MoE | Ornith 1.5 35B-A3B (Qwen3.5-MoE) | IQ4_XS experts, Q8_0 dense, BF16 projector | generation, MTP, image reading |
+| Vision-language, MoE | Qwopus-KAT-Coder 35B-A3B (Qwen3.5-MoE) | Q4_K_M with F32 projector | generation, MTP (3 and 4 draft tokens), tool calls, image and invoice reading (9/9), needle retrieval up to 180k tokens, fp8 and nvfp4 KV cache |
 | Text, MoE | Cyber-Tiel-Coder 35B-A3B (Qwen3.5-MoE) | UD-Q4_K_M (Q4_K / Q5_K experts, Q8_0 dense) | generation, MTP, tool calls, 24k-token needle retrieval |
 
 Decode and prefill use tensor-core kernels on a tiled weight layout for Q3_K,
