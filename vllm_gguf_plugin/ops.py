@@ -72,6 +72,7 @@ _CUDA_GEMV_QUANT_TYPES = frozenset(
         GGML_TYPE_IQ2_S,
         GGML_TYPE_IQ4_XS,
         GGML_TYPE_IQ1_M,
+        40,  # NVFP4: only the dequantize kernel exists (matmuls use the tiled layout or dequantize + GEMM)
     }
 )
 _CUDA_GEMM_QUANT_TYPES = frozenset(

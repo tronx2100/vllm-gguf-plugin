@@ -18,6 +18,7 @@ _BLOCK_BYTES = {
     int(WeightType.Q5_K): 176,
     int(WeightType.Q6_K): 210,
     int(WeightType.IQ3_XXS): 98,
+    int(WeightType.NVFP4): 144,     # 4 NVFP4 blocks of 64 weights (36 bytes) = one 256-weight group
     # IQ4_XS has a tiled kernel and repack too, but it is not faster than the dp4a kernel for up to 4 tokens
     # (table lookups dominate) and ~15 % slower for one token, so it stays on the row-major path:
     # int(WeightType.IQ4_XS): 136,
@@ -105,6 +106,17 @@ def repack(weight_type: int, weight: torch.Tensor):
         pad = torch.zeros(*sc8.shape[:-1], 8, dtype=torch.uint8, device=x.device)
         main = torch.cat([x[..., 8:136], sc8, pad], dim=-1)
         d = x[..., 0:2]
+    elif t == int(WeightType.NVFP4):
+        # 4 blocks of d[4] qs[32] per group -> qs plane [b][r][t][sp][j] (see mmvq_tiled.cuh) | scale plane [b][r][s]
+        blk = x.view(*x.shape[:-1], 4, 36)
+        d = blk[..., :4].clone()
+        d[d == 0x7F] = 0                                    # UE4M3 NaN code counts as zero (like GGML)
+        d = d.permute(0, 1, 3, 2, 4)                        # [T, B, b, r, s]
+        q = blk[..., 4:].reshape(*x.shape[:-1], 4, 4, 8)    # [T, B, r, b, s, 8 bytes]: byte k = weight k (low) | weight 8+k (high)
+        e = torch.cat([q & 0x0F, q >> 4], dim=-1)           # [T, B, r, b, s, 16 weights]
+        e = e.view(*e.shape[:-2], 2, 2, 4, 4)               # [.., sp, hl, t, j]
+        v = e[..., 0, :, :] | (e[..., 1, :, :] << 4)        # [T, B, r, b, sp, t, j]
+        main = v.permute(0, 1, 3, 2, 5, 4, 6)               # [T, B, b, r, t, sp, j]
     else:
         raise ValueError(f"unsupported type {t}")
     return main.contiguous().view(-1), d.contiguous().view(-1), rows, bpr * 256

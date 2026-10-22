@@ -434,6 +434,27 @@ static __global__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst
     }
 }
 
+
+// NVFP4: block of 64 = d[4] (UE4M3 scale per 16 weights) | qs[32] (byte k of a sub-block: weight k in the low, weight 8+k in the high nibble)
+__device__ __constant__ int8_t kvalues_nvfp4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+template<typename dst_t>
+static __global__ void dequantize_block_nvfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const uint8_t * x = (const uint8_t *) vx + (size_t) blockIdx.x * 36;
+    const int e = threadIdx.x;                 // 0..63
+    const int s = e >> 4, m = e & 15;
+    const int byte = x[4 + 8*s + (m & 7)];
+    const int nib = (m < 8) ? (byte & 15) : (byte >> 4);
+    const uint16_t h = (uint16_t) ((x[s] & 0x7F) << 7);     // e4m3 -> half by shifting; the 0x7F NaN code counts as 0
+    const float d = (x[s] == 0x7F) ? 0.0f : __half2float(__ushort_as_half(h)) * 128.0f;
+    yy[(size_t) blockIdx.x * 64 + e] = d * kvalues_nvfp4[nib];
+}
+
+template<typename dst_t>
+static void dequantize_row_nvfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    dequantize_block_nvfp4<<<k / 64, 64, 0, stream>>>(vx, y);
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k, cudaStream_t stream) {
     const int64_t num_blocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
@@ -565,6 +586,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
             return dequantize_row_iq4_xs_cuda;
         case 29:
             return dequantize_row_iq1_m_cuda;
+        case 40:
+            return dequantize_row_nvfp4_cuda;
         default:
             return nullptr;
     }
