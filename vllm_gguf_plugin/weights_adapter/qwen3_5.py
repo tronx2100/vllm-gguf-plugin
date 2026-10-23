@@ -45,6 +45,14 @@ QWEN35_ARCHITECTURES = {
     "qwen3_5_moe_text": "Qwen3_5MoeForConditionalGeneration",
 }
 
+# language-model-only classes, used when the GGUF has no multimodal projector
+QWEN35_TEXT_ARCHITECTURES = {
+    "qwen3_5": "Qwen3_5ForCausalLM",
+    "qwen3_5_text": "Qwen3_5ForCausalLM",
+    "qwen3_5_moe": "Qwen3_5MoeForCausalLM",
+    "qwen3_5_moe_text": "Qwen3_5MoeForCausalLM",
+}
+
 QWEN35_ATTN_SUBSTR: dict[str, str] = {
     "attn_norm.": "input_layernorm.",
     "post_attention_norm.": "post_attention_layernorm.",
@@ -211,11 +219,16 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         has_vision = getattr(patched, "vision_config", None) is not None
 
         if has_vision and files.mm_proj is None:
-            raise RuntimeError(
-                "Could not find mm_proj for multimodal Qwen3.5/3.6 GGUF. "
-                "Place *mmproj*.gguf beside the backbone or pass "
-                "model_loader_extra_config={'mm_proj': ...}."
+            # The base model can read images but the GGUF has no projector (a text-only conversion): load the
+            # language model only, as for a text-only base config, instead of refusing to start.
+            logger.warning(
+                "No mmproj file found for this multimodal Qwen3.5/3.6 GGUF: loading the text part only, image "
+                "input will not be available. Place *mmproj*.gguf beside the backbone (or pass "
+                "model_loader_extra_config={'mm_proj': ...}) to enable images."
             )
+            patched = patched.get_text_config()
+            architecture = QWEN35_TEXT_ARCHITECTURES[model_type]
+            has_vision = False
 
         if files.mm_proj is not None and not has_vision:
             config_cls = (

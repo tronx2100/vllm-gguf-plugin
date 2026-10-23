@@ -125,6 +125,12 @@ switches on expert parallelism by itself (a warning is logged; passing
 and up experts use different quantization types are re-encoded as Q8_0 for that
 layer, because vLLM fuses both into one parameter.
 
+A Qwen3.5/3.6 GGUF without a `*mmproj*.gguf` beside it (a text-only conversion of
+a multimodal base model) no longer aborts: the loader warns and loads the
+language model only (`Qwen3_5(Moe)ForCausalLM`). Image requests are then rejected
+by vLLM ("At most 0 image(s)"); put the model's mmproj file beside the GGUF to
+enable images.
+
 Decode and prefill use tensor-core kernels on a tiled weight layout for Q3_K,
 Q4_K, Q5_K, Q6_K, Q8_0, IQ3_XXS, IQ4_NL, IQ4_XS and NVFP4 (batches of up to 64
 tokens; larger batches dequantize and use a dense GEMM). Optionally (`GGUF_MOE_DEQUANT_MIN_TOKENS`, off by default) the expert weights of MoE
